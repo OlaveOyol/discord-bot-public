@@ -1,7 +1,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const packageMetadata = require("./package.json");
+const PROJECT_ROOT = path.resolve(__dirname, "..", "..");
+const packageMetadata = require(path.join(PROJECT_ROOT, "package.json"));
 
 const PACKAGE_NAME =
   typeof packageMetadata.name === "string" && packageMetadata.name.trim().length > 0
@@ -15,7 +16,7 @@ const BUILD_ID =
   typeof process.env.BOT_BUILD_ID === "string" && process.env.BOT_BUILD_ID.trim().length > 0
     ? process.env.BOT_BUILD_ID.trim()
     : null;
-const RELEASE_METADATA_PATH = path.join(__dirname, ".release.json");
+const RELEASE_METADATA_PATH = path.join(PROJECT_ROOT, ".release.json");
 
 function loadReleaseMetadata() {
   try {
