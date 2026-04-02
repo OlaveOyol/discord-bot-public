@@ -28,14 +28,36 @@ require_command npm
 require_command node
 require_command systemctl
 
-if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v yt-dlp >/dev/null 2>&1; then
+if ! command -v ffmpeg >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    apt-get install -y ffmpeg yt-dlp
+    apt-get install -y ffmpeg curl
   else
-    echo "Missing ffmpeg and/or yt-dlp and no apt-get is available to install them." >&2
+    echo "Missing ffmpeg and no apt-get is available to install it." >&2
     exit 1
   fi
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y curl
+  else
+    echo "Missing curl and no apt-get is available to install it." >&2
+    exit 1
+  fi
+fi
+
+install_yt_dlp() {
+  install -d -m 0755 /usr/local/bin
+  curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+  chmod 0755 /usr/local/bin/yt-dlp
+}
+
+if ! command -v yt-dlp >/dev/null 2>&1; then
+  install_yt_dlp
+else
+  install_yt_dlp
 fi
 
 if ! id "$APP_USER" >/dev/null 2>&1; then

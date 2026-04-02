@@ -141,10 +141,11 @@ pct create "$CTID" "$TEMPLATE" \
 pct start "$CTID"
 
 echo "Bootstrapping container packages"
-pct exec "$CTID" -- bash -lc "apt-get update && apt-get install -y ca-certificates curl gnupg ffmpeg git openssh-server sudo yt-dlp"
+pct exec "$CTID" -- bash -lc "apt-get update && apt-get install -y ca-certificates curl gnupg ffmpeg git openssh-server sudo"
 pct exec "$CTID" -- bash -lc "mkdir -p /etc/apt/keyrings && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg"
 pct exec "$CTID" -- bash -lc "echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main' > /etc/apt/sources.list.d/nodesource.list"
 pct exec "$CTID" -- bash -lc "apt-get update && apt-get install -y nodejs"
+pct exec "$CTID" -- bash -lc "curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod 0755 /usr/local/bin/yt-dlp"
 
 pct exec "$CTID" -- bash -lc "id -u ${SSH_LOGIN_USER} >/dev/null 2>&1 || useradd -m -s /bin/bash ${SSH_LOGIN_USER}"
 pct exec "$CTID" -- bash -lc "usermod -aG sudo ${SSH_LOGIN_USER}"

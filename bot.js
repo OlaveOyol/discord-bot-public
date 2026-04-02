@@ -1319,17 +1319,54 @@ async function runYtDlp(args) {
 }
 
 async function resolveYouTubeMediaUrl(track, url) {
-  const formatSelector = "bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio";
-  const baseArgs = ["--no-playlist", "--force-ipv4", "--no-progress", "-f", formatSelector, "-g", url];
   const attempts = [
-    ["--js-runtimes", "node", ...baseArgs],
-    baseArgs,
+    {
+      args: [
+        "--js-runtimes",
+        "node",
+        "--no-playlist",
+        "--force-ipv4",
+        "--no-progress",
+        "-f",
+        "bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio",
+        "-g",
+        url,
+      ],
+      tolerateMissingJsRuntime: true,
+    },
+    {
+      args: [
+        "--no-playlist",
+        "--force-ipv4",
+        "--no-progress",
+        "-f",
+        "bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio",
+        "-g",
+        url,
+      ],
+    },
+    {
+      args: ["--no-playlist", "--force-ipv4", "--no-progress", "-f", "bestaudio/best", "-g", url],
+    },
+    {
+      args: [
+        "--no-playlist",
+        "--force-ipv4",
+        "--no-progress",
+        "--extractor-args",
+        "youtube:player_client=android",
+        "-f",
+        "bestaudio/best",
+        "-g",
+        url,
+      ],
+    },
   ];
 
   let lastError = null;
-  for (const args of attempts) {
+  for (const attempt of attempts) {
     try {
-      const { stdout, stderr } = await runYtDlp(args);
+      const { stdout, stderr } = await runYtDlp(attempt.args);
       const lines = String(stdout || "")
         .split(/\r?\n/)
         .map((line) => line.trim())
@@ -1345,11 +1382,11 @@ async function resolveYouTubeMediaUrl(track, url) {
     } catch (error) {
       lastError = error;
       const stderr = String(error?.stderr || "").trim();
-      if (stderr && !stderr.includes("no such option: --js-runtimes")) {
+      if (stderr && !(attempt.tolerateMissingJsRuntime && stderr.includes("no such option: --js-runtimes"))) {
         logger.warn(`yt-dlp resolver failed for '${track.title}': ${stderr}`);
       }
-      if (!stderr.includes("no such option: --js-runtimes")) {
-        break;
+      if (attempt.tolerateMissingJsRuntime && stderr.includes("no such option: --js-runtimes")) {
+        continue;
       }
     }
   }
