@@ -2488,9 +2488,7 @@ function recordingLinkMessage(session, audioFiles) {
     return "Recording stopped, but no audio files were captured.";
   }
 
-  const links = audioFiles.map((name) => `[${name}](${session.indexUrl()}${encodeURIComponent(name)})`).join(", ");
-  const zipPart = session.archivePath ? ` | ZIP: [session.zip](${session.zipUrl()})` : "";
-  return `Recording saved. Download files: ${links}${zipPart} | Expires: ${session.expiresAt().toISOString()}`;
+  return `Recording saved. Browse it at ${downloadBaseUrl} | Expires: ${session.expiresAt().toISOString()}`;
 }
 
 function buildDiscordAuthorizationUrl(state) {
@@ -3019,7 +3017,7 @@ async function handleCommand(interaction) {
         throw new Error("Recording is already active in this guild.");
       }
 
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply();
       const connection = await state.ensureConnection(member, { requireReceive: true });
       await state.updateReceiveMode(true);
 
@@ -3029,9 +3027,7 @@ async function handleCommand(interaction) {
       session.attach(connection, guild);
       state.recording = session;
       await state.refreshState();
-      await safeReply(interaction, `Recording started. Files will be available at ${session.indexUrl()}`, {
-        ephemeral: true,
-      });
+      await safeReply(interaction, `Recording started. Browse recordings at ${downloadBaseUrl}`);
       return;
     }
     case "recordstop": {
@@ -3039,20 +3035,20 @@ async function handleCommand(interaction) {
         throw new Error("There is no active recording in this guild.");
       }
 
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply();
       const session = state.recording;
       state.recording = null;
       await finalizeRecording(session);
       await state.updateReceiveMode(false);
       await state.refreshState();
       const audioFiles = await session.audioFiles();
-      await safeReply(interaction, recordingLinkMessage(session, audioFiles), { ephemeral: true });
+      await safeReply(interaction, recordingLinkMessage(session, audioFiles));
       return;
     }
     case "recordlink": {
       await interaction.deferReply({ ephemeral: true });
       if (state.recording) {
-        await safeReply(interaction, `Recording in progress: ${state.recording.indexUrl()}`, { ephemeral: true });
+        await safeReply(interaction, `Recording in progress. Browse recordings at ${downloadBaseUrl}`, { ephemeral: true });
         return;
       }
 
@@ -3064,7 +3060,7 @@ async function handleCommand(interaction) {
 
       await safeReply(
         interaction,
-        `Latest recording: ${latest.indexUrl()} | ZIP: ${latest.archivePath ? latest.zipUrl() : "not available"}`,
+        `Latest recording available at ${downloadBaseUrl}`,
         { ephemeral: true },
       );
       return;
