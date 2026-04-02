@@ -6,7 +6,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 
-const { loadArtifactManifest } = require("../../artifact-ota");
+const { loadArtifactManifest } = require("../../src/ota/artifact-ota");
 
 function parseArgs(argv) {
   const args = { _: [] };

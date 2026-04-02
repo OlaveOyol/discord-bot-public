@@ -120,7 +120,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 - graceful restarts now persist the active voice channel, current track offset, queue, and pause state so OTA deploys can resume playback instead of clearing the queue
 - Discord voice receive is still not officially documented by Discord, but the Node voice stack here is the chosen path over the previous Python receive extension.
 - The website login uses Discord OAuth `identify` scope only. Session matching works by the Discord user IDs already embedded in per-user WAV filenames.
-- The recordings web UI now lives in a separate renderer module, `recordings-web.js`, instead of being embedded directly inside the bot routes.
+- The recordings web UI now lives in `src/web/recordings-web.js` instead of being embedded directly inside the bot routes.
 
 ## Proxmox / LXC
 
@@ -159,12 +159,12 @@ Run this on the Proxmox host as `root`:
 cd /root
 git clone https://github.com/OlaveOyol/discord-bot-public.git
 cd discord-bot-public
-chmod +x scripts/proxmox-create-lxc.sh
+chmod +x deploy/scripts/proxmox-create-lxc.sh
 START_CTID=192 \
 START_IP=192.168.68.15 \
 SSH_PUBLIC_KEY_FILE=/root/.ssh/id_ed25519.pub \
 REPO_URL=https://github.com/OlaveOyol/discord-bot-public.git \
-./scripts/proxmox-create-lxc.sh
+./deploy/scripts/proxmox-create-lxc.sh
 ```
 
 What it does:
@@ -201,8 +201,8 @@ Clone the repo into `/opt/discord-bot`, copy `.env`, then run:
 
 ```bash
 cd /opt/discord-bot
-chmod +x scripts/deploy.sh
-sudo APP_DIR=/opt/discord-bot SERVICE_NAME=discord-bot BRANCH=main ./scripts/deploy.sh
+chmod +x deploy/scripts/deploy.sh
+sudo APP_DIR=/opt/discord-bot SERVICE_NAME=discord-bot BRANCH=main ./deploy/scripts/deploy.sh
 ```
 
 The deploy script:
@@ -217,7 +217,7 @@ The deploy script:
 
 ### GitHub Actions Deploy
 
-The repo includes [deploy.yml](./.github/workflows/deploy.yml). Pushes to `main` and manual workflow runs will SSH into the container and run `scripts/deploy.sh`.
+The repo includes [deploy.yml](./.github/workflows/deploy.yml). Pushes to `main` and manual workflow runs will SSH into the container and run `deploy/scripts/deploy.sh`.
 
 Required GitHub repository secrets:
 
@@ -260,7 +260,10 @@ If you want direct editing from your IDE as well, point VS Code Remote SSH at th
 
 The systemd unit lives at [discord-bot.service](./deploy/systemd/discord-bot.service).
 
-The release-layout and supervisor notes live in [deploy/ota/README.md](./deploy/ota/README.md).
+Additional docs:
+
+- [Repository Layout](./docs/architecture/repository-layout.md)
+- [OTA Supervisor Operations](./docs/operations/ota-supervisor.md)
 
 Common commands on the container:
 

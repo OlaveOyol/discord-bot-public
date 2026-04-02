@@ -1,7 +1,7 @@
 const path = require("node:path");
 
 const { loadArtifactManifest, normalizeArtifactManifest } = require("./artifact-ota");
-const { createRuntimeHealthModel } = require("./runtime-health");
+const { createRuntimeHealthModel } = require("../runtime/runtime-health");
 const {
   loadPersistedPendingUpdate,
   normalizePendingUpdate,
