@@ -71,6 +71,7 @@ const DOWNLOAD_PORT_SEARCH_ATTEMPTS = Math.max(
   Number.parseInt(env("DOWNLOAD_PORT_SEARCH_ATTEMPTS", "20"), 10),
 );
 const RECORDINGS_DIR = env("RECORDINGS_DIR", path.join(os.tmpdir(), "discord-bot-recordings"));
+const PLAYBACK_STATE_PATH = env("PLAYBACK_STATE_PATH", path.join(RECORDINGS_DIR, "_playback-state.json"));
 const RECORDINGS_TTL_DAYS = Math.min(31, Math.max(1, Number.parseInt(env("RECORDINGS_TTL_DAYS", "30"), 10)));
 const RECENT_RECORDINGS_DAYS = Math.min(
   RECORDINGS_TTL_DAYS,
@@ -215,13 +216,8 @@ function acquireInstanceLock() {
 }
 
 acquireInstanceLock();
-["exit", "SIGINT", "SIGTERM", "SIGBREAK"].forEach((signal) => {
-  process.on(signal, () => {
-    releaseInstanceLock();
-    if (signal !== "exit") {
-      process.exit(0);
-    }
-  });
+process.on("exit", () => {
+  releaseInstanceLock();
 });
 
 function getGuildState(guildId) {
@@ -231,6 +227,107 @@ function getGuildState(guildId) {
     guildStates.set(guildId, state);
   }
   return state;
+}
+
+function trackFromSnapshot(track) {
+  if (!track || typeof track !== "object") {
+    return null;
+  }
+
+  return createTrack({
+    title: track.title,
+    webpageUrl: track.webpageUrl,
+    duration: track.duration,
+    thumbnail: track.thumbnail,
+    requestedBy: track.requestedBy,
+    streamUrl: track.streamUrl,
+    searchQuery: track.searchQuery,
+    resumeOffsetMs: track.resumeOffsetMs,
+  });
+}
+
+async function savePlaybackSnapshot() {
+  const guilds = [...guildStates.values()]
+    .map((state) => state.toPlaybackSnapshot())
+    .filter(Boolean);
+
+  if (guilds.length === 0) {
+    await fsp.rm(PLAYBACK_STATE_PATH, { force: true }).catch(() => {});
+    return;
+  }
+
+  const payload = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    guilds,
+  };
+  await fsp.writeFile(PLAYBACK_STATE_PATH, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+async function restorePlaybackSnapshot() {
+  const payload = await fsp
+    .readFile(PLAYBACK_STATE_PATH, "utf8")
+    .then((content) => JSON.parse(content))
+    .catch(() => null);
+  if (!payload || !Array.isArray(payload.guilds) || payload.guilds.length === 0) {
+    return;
+  }
+
+  await fsp.rm(PLAYBACK_STATE_PATH, { force: true }).catch(() => {});
+
+  for (const guildSnapshot of payload.guilds) {
+    const guild = client.guilds.cache.get(guildSnapshot.guildId);
+    if (!guild) {
+      continue;
+    }
+
+    const channel = guild.channels.cache.get(guildSnapshot.channelId)
+      || (await guild.channels.fetch(guildSnapshot.channelId).catch(() => null));
+    if (!channel?.isVoiceBased?.()) {
+      continue;
+    }
+
+    const state = getGuildState(guild.id);
+    state.controllerChannelId = guildSnapshot.controllerChannelId || state.controllerChannelId;
+    state.panelQueueVisible = Boolean(guildSnapshot.panelQueueVisible);
+    state.history = Array.isArray(guildSnapshot.history)
+      ? guildSnapshot.history.map(trackFromSnapshot).filter(Boolean)
+      : [];
+
+    const restoredQueue = [];
+    const restoredCurrent = trackFromSnapshot(guildSnapshot.current);
+    if (restoredCurrent) {
+      restoredQueue.push(restoredCurrent);
+    }
+    if (Array.isArray(guildSnapshot.queue)) {
+      restoredQueue.push(...guildSnapshot.queue.map(trackFromSnapshot).filter(Boolean));
+    }
+    if (restoredQueue.length === 0) {
+      continue;
+    }
+
+    state.queue = restoredQueue;
+    state.current = null;
+    state.currentOffsetMs = 0;
+    state.playbackStartedAtMs = null;
+
+    try {
+      await state.ensureConnectionToChannel(channel);
+      await state.playNext();
+      if (guildSnapshot.paused) {
+        await state.pause();
+      }
+      logger.info(
+        `Restored playback state in guild ${guild.id} with ${restoredQueue.length} track(s) from pre-restart snapshot.`,
+      );
+    } catch (error) {
+      logger.warn(`Failed to restore playback state in guild ${guild.id}: ${error.message}`);
+      state.queue = [];
+      state.current = null;
+      state.currentOffsetMs = 0;
+      state.playbackStartedAtMs = null;
+    }
+  }
 }
 
 function formatDuration(seconds) {
@@ -523,6 +620,7 @@ function createTrack({
   requestedBy,
   streamUrl = null,
   searchQuery = null,
+  resumeOffsetMs = 0,
 }) {
   return {
     title: title || "Unknown title",
@@ -532,6 +630,7 @@ function createTrack({
     requestedBy: requestedBy || "unknown",
     streamUrl: streamUrl || null,
     searchQuery: searchQuery || null,
+    resumeOffsetMs: Number.isFinite(resumeOffsetMs) ? Math.max(0, Math.floor(resumeOffsetMs)) : 0,
   };
 }
 
@@ -1184,6 +1283,8 @@ class GuildState {
     this.playingNext = false;
     this.connection = null;
     this.deferPanelRefresh = false;
+    this.currentOffsetMs = 0;
+    this.playbackStartedAtMs = null;
     this.player = createAudioPlayer({
       behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
     });
@@ -1198,7 +1299,13 @@ class GuildState {
       }
     });
 
-    this.player.on("stateChange", () => {
+    this.player.on("stateChange", (oldState, newState) => {
+      if (oldState.status === AudioPlayerStatus.Playing && newState.status !== AudioPlayerStatus.Playing) {
+        this.currentOffsetMs = this.currentPlaybackOffsetMs();
+        this.playbackStartedAtMs = null;
+      } else if (oldState.status !== AudioPlayerStatus.Playing && newState.status === AudioPlayerStatus.Playing && this.current) {
+        this.playbackStartedAtMs = Date.now();
+      }
       void this.refreshState();
     });
   }
@@ -1226,18 +1333,26 @@ class GuildState {
     return Boolean(this.current || this.queue.length > 0 || this.isPlaying() || this.isPaused());
   }
 
-  async refreshState() {
-    if (!this.deferPanelRefresh) {
-      await refreshPlayerPanel(this.guildId);
+  currentPlaybackOffsetMs() {
+    if (!this.current) {
+      return 0;
     }
-    refreshPresence();
-    void refreshVoiceLifecycle(this.guildId);
+
+    let offset = this.currentOffsetMs;
+    if (this.playbackStartedAtMs && this.isPlaying()) {
+      offset += Math.max(0, Date.now() - this.playbackStartedAtMs);
+    }
+
+    const durationMs = Number.isFinite(this.current.duration) ? this.current.duration * 1000 : null;
+    if (durationMs !== null) {
+      offset = Math.min(offset, Math.max(0, durationMs));
+    }
+    return Math.max(0, Math.floor(offset));
   }
 
-  async ensureConnection(member, { requireReceive = false } = {}) {
-    const voiceChannel = member?.voice?.channel;
+  async ensureConnectionToChannel(voiceChannel, { requireReceive = false } = {}) {
     if (!voiceChannel) {
-      throw new Error("You must join a voice channel first.");
+      throw new Error("Voice channel is required.");
     }
 
     let connection = this.connection || getVoiceConnection(this.guildId);
@@ -1267,6 +1382,22 @@ class GuildState {
     connection.subscribe(this.player);
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
     return connection;
+  }
+
+  async refreshState() {
+    if (!this.deferPanelRefresh) {
+      await refreshPlayerPanel(this.guildId);
+    }
+    refreshPresence();
+    void refreshVoiceLifecycle(this.guildId);
+  }
+
+  async ensureConnection(member, { requireReceive = false } = {}) {
+    const voiceChannel = member?.voice?.channel;
+    if (!voiceChannel) {
+      throw new Error("You must join a voice channel first.");
+    }
+    return this.ensureConnectionToChannel(voiceChannel, { requireReceive });
   }
 
   async updateReceiveMode(requireReceive) {
@@ -1338,8 +1469,11 @@ class GuildState {
         }
 
         this.current = nextTrack;
+        this.currentOffsetMs = Number.isFinite(nextTrack.resumeOffsetMs) ? Math.max(0, nextTrack.resumeOffsetMs) : 0;
+        this.playbackStartedAtMs = null;
         try {
           const { resource, stream } = await createPlaybackResource(nextTrack);
+          this.currentOffsetMs = Number.isFinite(nextTrack.resumeOffsetMs) ? Math.max(0, nextTrack.resumeOffsetMs) : 0;
           this.player.play(resource);
           if (stream && typeof play.attachListeners === "function") {
             play.attachListeners(this.player, stream);
@@ -1348,6 +1482,8 @@ class GuildState {
         } catch (error) {
           logger.warn(`Failed to play track in guild ${this.guildId}: ${error.message}`);
           this.current = null;
+          this.currentOffsetMs = 0;
+          this.playbackStartedAtMs = null;
         }
       }
     } finally {
@@ -1358,16 +1494,21 @@ class GuildState {
 
   async onTrackFinished() {
     if (this.current) {
+      this.current.resumeOffsetMs = 0;
       this.history.unshift(this.current);
       this.history = this.history.slice(0, 20);
     }
     this.current = null;
+    this.currentOffsetMs = 0;
+    this.playbackStartedAtMs = null;
     await this.playNext();
   }
 
   async pause() {
     const paused = this.player.pause(true);
     if (paused) {
+      this.currentOffsetMs = this.currentPlaybackOffsetMs();
+      this.playbackStartedAtMs = null;
       await this.refreshState();
     }
     return paused;
@@ -1376,6 +1517,7 @@ class GuildState {
   async resume() {
     const resumed = this.player.unpause();
     if (resumed) {
+      this.playbackStartedAtMs = Date.now();
       await this.refreshState();
     }
     return resumed;
@@ -1386,6 +1528,8 @@ class GuildState {
       return false;
     }
 
+    this.currentOffsetMs = 0;
+    this.playbackStartedAtMs = null;
     this.player.stop(true);
     await this.refreshState();
     return true;
@@ -1416,6 +1560,8 @@ class GuildState {
   async stopPlayback() {
     this.queue = [];
     this.current = null;
+    this.currentOffsetMs = 0;
+    this.playbackStartedAtMs = null;
     this.panelQueueVisible = false;
     this.player.stop(true);
     await this.refreshState();
@@ -1432,6 +1578,30 @@ class GuildState {
     }
     await this.refreshState();
     return true;
+  }
+
+  toPlaybackSnapshot() {
+    const channelId = this.connection?.joinConfig?.channelId || null;
+    const current = this.current
+      ? {
+          ...this.current,
+          resumeOffsetMs: this.currentPlaybackOffsetMs(),
+        }
+      : null;
+    if (!channelId || (!current && this.queue.length === 0)) {
+      return null;
+    }
+
+    return {
+      guildId: this.guildId,
+      channelId,
+      controllerChannelId: this.controllerChannelId || null,
+      panelQueueVisible: Boolean(this.panelQueueVisible),
+      current,
+      queue: this.queue.map((track) => ({ ...track, resumeOffsetMs: 0 })),
+      history: this.history.slice(0, 20).map((track) => ({ ...track, resumeOffsetMs: 0 })),
+      paused: this.isPaused(),
+    };
   }
 }
 
@@ -1940,12 +2110,24 @@ async function hydrateTrack(track) {
 async function createPlaybackResource(track) {
   const hydrated = await hydrateTrack(track);
   const sourceUrl = hydrated.sourceUrl;
+  const seekSeconds = Math.max(0, Math.floor((track.resumeOffsetMs || 0) / 1000));
 
   if (isYouTubeUrl(sourceUrl)) {
-    return { resource: await createYouTubeResource(track, sourceUrl), stream: null };
+    return { resource: await createYouTubeResource(track, sourceUrl, seekSeconds), stream: null };
   }
 
-  const stream = await play.stream(sourceUrl);
+  let stream;
+  try {
+    stream = seekSeconds > 0 ? await play.stream(sourceUrl, { seek: seekSeconds }) : await play.stream(sourceUrl);
+  } catch (error) {
+    if (seekSeconds > 0) {
+      logger.warn(`Playback resume seek unsupported for '${track.title}', retrying from the start: ${error.message}`);
+      track.resumeOffsetMs = 0;
+      stream = await play.stream(sourceUrl);
+    } else {
+      throw error;
+    }
+  }
   const resource = createAudioResource(stream.stream, {
     inputType: stream.type || StreamType.Arbitrary,
     metadata: track,
@@ -2055,8 +2237,9 @@ async function resolveYouTubeMediaUrl(track, url) {
   throw new Error(lastError?.stderr?.trim() || lastError?.message || "yt-dlp failed to resolve a media URL");
 }
 
-async function createYouTubeResource(track, url) {
+async function createYouTubeResource(track, url, seekSeconds = 0) {
   const mediaUrl = await resolveYouTubeMediaUrl(track, url);
+  const seekArgs = seekSeconds > 0 ? ["-ss", String(seekSeconds)] : [];
   const ffmpeg = spawn(
     env("FFMPEG_PATH", "ffmpeg"),
     [
@@ -2072,6 +2255,7 @@ async function createYouTubeResource(track, url) {
       "32M",
       "-loglevel",
       "error",
+      ...seekArgs,
       "-i",
       mediaUrl,
       "-vn",
@@ -3219,6 +3403,7 @@ client.once("ready", async () => {
   await configurePlayDl();
   await startDownloadServer();
   await syncCommands();
+  await restorePlaybackSnapshot();
   refreshPresence();
   startPresenceLoop();
   setInterval(() => {
@@ -3230,8 +3415,20 @@ client.on("error", (error) => {
   logger.error(`Client error: ${error.message}`);
 });
 
-process.on("SIGINT", async () => {
-  logger.info("Shutting down...");
+let shuttingDown = false;
+async function shutdown(signal = "unknown") {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  logger.info(`Shutting down on ${signal}...`);
+
+  try {
+    await savePlaybackSnapshot();
+  } catch (error) {
+    logger.warn(`Failed to save playback snapshot during shutdown: ${error.message}`);
+  }
+
   if (downloadServer) {
     downloadServer.close();
   }
@@ -3240,14 +3437,23 @@ process.on("SIGINT", async () => {
     if (state.recording) {
       const session = state.recording;
       state.recording = null;
-      await finalizeRecording(session);
+      await finalizeRecording(session).catch((error) => {
+        logger.warn(`Failed to finalize recording during shutdown in guild ${state.guildId}: ${error.message}`);
+      });
     }
     const connection = state.connection || getVoiceConnection(state.guildId);
     connection?.destroy();
   }
 
-  await client.destroy();
+  await client.destroy().catch(() => {});
+  releaseInstanceLock();
   process.exit(0);
+}
+
+["SIGINT", "SIGTERM", "SIGBREAK"].forEach((signal) => {
+  process.on(signal, () => {
+    void shutdown(signal);
+  });
 });
 
 client.login(TOKEN);

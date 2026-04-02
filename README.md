@@ -53,6 +53,7 @@ This bot can:
 - `RECENT_RECORDINGS_DAYS` - recent/archive split window in days, default `7`
 - `ARCHIVE_AUDIO_BITRATE` - ffmpeg bitrate used when older recordings are compressed for archives, default `48k`
 - `RECORDING_OUTPUT_FORMAT` - output format for recent per-user stems, default `flac`, supported: `wav`, `flac`
+- `PLAYBACK_STATE_PATH` - optional path for persisted queue/current-track state across graceful restarts, default inside `RECORDINGS_DIR`
 - `CLEANUP_INTERVAL_SECONDS` - expired-recording cleanup interval, default `3600`
 - `AFK_DISCONNECT_SECONDS` - idle timeout before leaving voice, default `300`
 - `RECORDING_RESUBSCRIBE_DELAY_MS` - delay before retrying a speaker stream after a bad packet/decode error, default `350`
@@ -113,6 +114,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 - Spotify playlist links fall back to Spotify web metadata when API calls fail.
 - SoundCloud playback is enabled through `play-dl` and depends on its free client ID lookup succeeding at startup.
 - Commands are synced per guild on startup so they appear quickly in servers the bot is already in.
+- graceful restarts now persist the active voice channel, current track offset, queue, and pause state so OTA deploys can resume playback instead of clearing the queue
 - Discord voice receive is still not officially documented by Discord, but the Node voice stack here is the chosen path over the previous Python receive extension.
 - The website login uses Discord OAuth `identify` scope only. Session matching works by the Discord user IDs already embedded in per-user WAV filenames.
 - The recordings web UI now lives in a separate renderer module, `recordings-web.js`, instead of being embedded directly inside the bot routes.
