@@ -460,6 +460,37 @@ function parseParticipantIdsFromFileNames(fileNames) {
   return [...ids].sort();
 }
 
+function normalizeDiscordUserIds(values) {
+  const items = Array.isArray(values) ? values : values === undefined || values === null ? [] : [values];
+  return [...new Set(items.map((value) => String(value || "").trim()).filter((value) => /^\d{15,22}$/.test(value)))].sort();
+}
+
+function mergeDiscordUserIds(existing, values) {
+  const current = Array.isArray(existing) ? existing : [];
+  const next = Array.isArray(values) ? values : values === undefined || values === null ? [] : [values];
+  return normalizeDiscordUserIds([...current, ...next]);
+}
+
+function normalizeAudioFileNames(fileNames) {
+  const items = Array.isArray(fileNames) ? fileNames : [];
+  return [...new Set(
+    items
+      .map((value) => String(value || "").trim())
+      .filter((value) => value && path.basename(value) === value && AUDIO_FILE_EXTENSIONS.has(path.extname(value).toLowerCase())),
+  )].sort();
+}
+
+function listVoiceChannelMemberIds(guild, channelId) {
+  const channel = channelId ? guild?.channels?.cache?.get(channelId) : null;
+  if (!channel?.members) {
+    return [];
+  }
+
+  return [...channel.members.values()]
+    .filter((member) => !member.user?.bot)
+    .map((member) => member.id);
+}
+
 function getSessionReferenceTime(session) {
   return session.completedAt || session.startedAt;
 }
@@ -599,13 +630,33 @@ function discordAvatarUrl(user) {
 }
 
 async function getSessionParticipantIds(session) {
+  if (Array.isArray(session.authorizedUserIds) && session.authorizedUserIds.length > 0) {
+    return session.authorizedUserIds;
+  }
   if (Array.isArray(session.participantIds) && session.participantIds.length > 0) {
     return session.participantIds;
   }
-  const audioFiles = await session.audioFiles();
-  const participantIds = parseParticipantIdsFromFileNames(audioFiles);
+  if (Array.isArray(session.speakerUserIds) && session.speakerUserIds.length > 0) {
+    session.participantIds = session.speakerUserIds;
+    return session.participantIds;
+  }
+  const audioFiles = await getSessionDownloadableAudioFiles(session);
+  const speakerUserIds = parseParticipantIdsFromFileNames(audioFiles);
+  session.speakerUserIds = speakerUserIds;
+  const participantIds = speakerUserIds;
   session.participantIds = participantIds;
   return participantIds;
+}
+
+async function getSessionDownloadableAudioFiles(session) {
+  const manifestFiles = normalizeAudioFileNames(session.files);
+  if (manifestFiles.length > 0) {
+    return manifestFiles;
+  }
+
+  const audioFiles = await session.audioFiles();
+  session.files = normalizeAudioFileNames(audioFiles);
+  return session.files;
 }
 
 async function requireRecordingAccess(req, res, session) {
@@ -744,6 +795,9 @@ class RecordingSession {
     this.archivePath = null;
     this.archived = false;
     this.participantIds = null;
+    this.authorizedUserIds = [];
+    this.speakerUserIds = [];
+    this.files = [];
     this.receiver = null;
     this.connection = null;
     this.speakingListener = null;
@@ -781,6 +835,27 @@ class RecordingSession {
     this.subscribePresentMembers(guild);
   }
 
+  captureAttendanceSnapshot(guild) {
+    const memberIds = listVoiceChannelMemberIds(guild, this.channelId);
+    if (memberIds.length === 0) {
+      return [];
+    }
+
+    this.authorizedUserIds = mergeDiscordUserIds(this.authorizedUserIds, memberIds);
+    this.participantIds = [...this.authorizedUserIds];
+    return memberIds;
+  }
+
+  noteAuthorizedUser(userId) {
+    this.authorizedUserIds = mergeDiscordUserIds(this.authorizedUserIds, userId);
+    this.participantIds = [...this.authorizedUserIds];
+  }
+
+  noteSpeakerUser(userId) {
+    this.speakerUserIds = mergeDiscordUserIds(this.speakerUserIds, userId);
+    this.noteAuthorizedUser(userId);
+  }
+
   getWriter(guild, userId) {
     let writer = this.fileWriters.get(userId);
     if (writer) {
@@ -797,15 +872,7 @@ class RecordingSession {
   }
 
   subscribePresentMembers(guild) {
-    const channel = guild.channels.cache.get(this.channelId);
-    if (!channel?.members) {
-      return;
-    }
-
-    for (const [userId, member] of channel.members) {
-      if (member.user?.bot) {
-        continue;
-      }
+    for (const userId of this.captureAttendanceSnapshot(guild)) {
       void this.subscribeUser(guild, userId).catch((error) => {
         logger.warn(`Recording subscribe error for user ${userId} in guild ${guild.id}: ${error.message}`);
       });
@@ -880,6 +947,7 @@ class RecordingSession {
       if (chunkLength <= 0) {
         return;
       }
+      this.noteSpeakerUser(userId);
       const writer = entry.writer || this.getWriter(guild, userId);
       entry.writer = writer;
       entry.receivedPcmBytes += chunkLength;
@@ -894,7 +962,10 @@ class RecordingSession {
     this.userStreams.set(userId, { opusStream, decoder, writer: null, receivedPcmBytes: 0 });
   }
 
-  async stop() {
+  async stop(guild = null) {
+    if (guild) {
+      this.captureAttendanceSnapshot(guild);
+    }
     if (this.receiver && this.speakingListener) {
       this.receiver.speaking.off("start", this.speakingListener);
     }
@@ -986,8 +1057,20 @@ class RecordingSession {
 
   async writeMetadata() {
     const audioFiles = await this.audioFiles();
+    const normalizedFiles = normalizeAudioFileNames(audioFiles);
+    const speakerUserIds = normalizeDiscordUserIds(
+      this.speakerUserIds.length > 0 ? this.speakerUserIds : parseParticipantIdsFromFileNames(normalizedFiles),
+    );
+    const authorizedUserIds = normalizeDiscordUserIds(
+      this.authorizedUserIds.length > 0 ? this.authorizedUserIds : this.participantIds,
+    );
+    const participantIds = authorizedUserIds.length > 0 ? [...authorizedUserIds] : [...speakerUserIds];
+    this.files = normalizedFiles;
+    this.speakerUserIds = speakerUserIds;
+    this.authorizedUserIds = authorizedUserIds;
+    this.participantIds = participantIds;
     const payload = {
-      version: 1,
+      version: 2,
       token: this.token,
       guildId: this.guildId,
       guildName: this.guildName || null,
@@ -995,8 +1078,10 @@ class RecordingSession {
       channelName: this.channelName || null,
       startedAt: this.startedAt.toISOString(),
       completedAt: this.completedAt ? this.completedAt.toISOString() : null,
-      participantIds: parseParticipantIdsFromFileNames(audioFiles),
-      files: audioFiles,
+      participantIds,
+      authorizedUserIds,
+      speakerUserIds,
+      files: normalizedFiles,
       recentWindowDays: RECENT_RECORDINGS_DAYS,
       archived: Boolean(this.archived),
       archiveName: this.archivePath ? path.basename(this.archivePath) : null,
@@ -1035,7 +1120,10 @@ async function restoreRecordingSessionFromDirectory(directoryPath) {
   session.directory = directoryPath;
   session.archivePath = archiveStat ? archivePath : null;
   session.archived = Boolean(metadata?.archived);
-  session.participantIds = Array.isArray(metadata?.participantIds) ? metadata.participantIds : null;
+  session.participantIds = normalizeDiscordUserIds(metadata?.participantIds);
+  session.authorizedUserIds = normalizeDiscordUserIds(metadata?.authorizedUserIds);
+  session.speakerUserIds = normalizeDiscordUserIds(metadata?.speakerUserIds);
+  session.files = normalizeAudioFileNames(metadata?.files);
   session.receiver = null;
   session.connection = null;
   session.speakingListener = null;
@@ -1105,8 +1193,24 @@ async function listRecordingSessions() {
   });
 }
 
+async function findLatestCompletedRecordingForGuild(guildId) {
+  const cachedToken = latestRecordingByGuild.get(guildId);
+  if (cachedToken) {
+    const cached = await resolveRecordingSession(cachedToken);
+    if (cached?.guildId === guildId && cached.completedAt) {
+      return cached;
+    }
+  }
+
+  const latest = (await listRecordingSessions()).find((session) => session.guildId === guildId && session.completedAt) || null;
+  if (latest) {
+    latestRecordingByGuild.set(guildId, latest.token);
+  }
+  return latest;
+}
+
 async function summarizeRecordingSession(session) {
-  const audioFiles = await session.audioFiles();
+  const audioFiles = await getSessionDownloadableAudioFiles(session);
   const audioStats = await Promise.all(
     audioFiles.map(async (name) => {
       const filePath = path.join(session.directory, name);
@@ -1115,10 +1219,7 @@ async function summarizeRecordingSession(session) {
     }),
   );
   const archiveSize = ((await fsp.stat(session.archivePath).catch(() => null))?.size || 0);
-  const participantIds =
-    Array.isArray(session.participantIds) && session.participantIds.length > 0
-      ? [...session.participantIds]
-      : parseParticipantIdsFromFileNames(audioFiles);
+  const participantIds = await getSessionParticipantIds(session);
   session.participantIds = participantIds;
   const archived = Boolean(session.archived);
 
@@ -2606,8 +2707,8 @@ async function refreshPlayerPanel(guildId, { repost = false } = {}) {
   }
 }
 
-async function finalizeRecording(session) {
-  await session.stop();
+async function finalizeRecording(session, guild = null) {
+  await session.stop(guild);
   completedRecordings.set(session.token, session);
   latestRecordingByGuild.set(session.guildId, session.token);
 }
@@ -2645,7 +2746,7 @@ async function disconnectGuild(guildId, reason) {
     if (state.recording) {
       const session = state.recording;
       state.recording = null;
-      await finalizeRecording(session);
+      await finalizeRecording(session, state.guild);
     }
 
     state.queue = [];
@@ -2856,12 +2957,17 @@ async function pruneExpiredRecordings() {
   }
 }
 
-function recordingLinkMessage(session, audioFiles) {
+function recordingLinkMessage(session, audioFiles, { prefix = "Recording saved." } = {}) {
   if (audioFiles.length === 0) {
     return "Recording stopped, but no audio files were captured.";
   }
 
-  return `Recording saved. Browse it at ${downloadBaseUrl} | Expires: ${session.expiresAt().toISOString()}`;
+  const lines = [`${prefix} Session: ${session.indexUrl()}`];
+  if (session.archivePath) {
+    lines.push(`ZIP: ${session.zipUrl()}`);
+  }
+  lines.push(`Expires: ${session.expiresAt().toISOString()}`);
+  return lines.join("\n");
 }
 
 function buildDiscordAuthorizationUrl(state) {
@@ -3136,7 +3242,7 @@ async function startDownloadServer() {
       return;
     }
 
-    const audioFiles = await session.audioFiles();
+    const audioFiles = await getSessionDownloadableAudioFiles(session);
     const fileStats = await Promise.all(
       audioFiles.map(async (name) => {
         const stat = await fsp.stat(path.join(session.directory, name)).catch(() => null);
@@ -3198,6 +3304,18 @@ async function startDownloadServer() {
       return;
     }
 
+    const requestedName = path.basename(req.params.filename);
+    if (requestedName !== req.params.filename) {
+      res.status(404).send("File not found");
+      return;
+    }
+
+    const allowedFiles = await getSessionDownloadableAudioFiles(session);
+    if (!allowedFiles.includes(requestedName)) {
+      res.status(404).send("File not found");
+      return;
+    }
+
     res.sendFile(requestedPath, (error) => {
       if (error) {
         res.status(error.statusCode || 404).end();
@@ -3241,6 +3359,40 @@ async function fetchInteractionMember(interaction) {
   return interaction.guild.members.fetch(interaction.user.id);
 }
 
+function getActiveVoiceChannelId(state) {
+  if (state?.recording?.channelId) {
+    return state.recording.channelId;
+  }
+
+  const connection = state?.connection || (state?.guildId ? getVoiceConnection(state.guildId) : null);
+  if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) {
+    return null;
+  }
+
+  return connection.joinConfig.channelId || null;
+}
+
+async function requireSameVoiceContext(interaction, state, { actionDescription, requireVoiceWhenDisconnected = false } = {}) {
+  const member = await fetchInteractionMember(interaction);
+  const memberChannelId = member.voice?.channelId || null;
+  const activeChannelId = getActiveVoiceChannelId(state);
+  if (activeChannelId) {
+    if (!memberChannelId) {
+      throw new Error(`Join <#${activeChannelId}> to ${actionDescription}.`);
+    }
+    if (memberChannelId !== activeChannelId) {
+      throw new Error(`You must be in <#${activeChannelId}> to ${actionDescription}.`);
+    }
+    return member;
+  }
+
+  if (requireVoiceWhenDisconnected && !memberChannelId) {
+    throw new Error("You must join a voice channel first.");
+  }
+
+  return member;
+}
+
 const COMMANDS = [
   new SlashCommandBuilder().setName("ping").setDescription("Check if the bot is online"),
   new SlashCommandBuilder().setName("join").setDescription("Join your current voice channel"),
@@ -3279,14 +3431,16 @@ async function syncCommands() {
 }
 
 async function handlePlay(interaction, { next = false } = {}) {
-  await interaction.deferReply();
   const guild = interaction.guild;
-  const member = await fetchInteractionMember(interaction);
-  if (!guild || !member?.voice?.channel) {
-    throw new Error("You must join a voice channel first.");
+  if (!guild) {
+    throw new Error("This command must be used in a guild.");
   }
-
+  await interaction.deferReply();
   const state = getGuildState(guild.id);
+  const member = await requireSameVoiceContext(interaction, state, {
+    actionDescription: next ? "queue tracks next" : "queue music",
+    requireVoiceWhenDisconnected: true,
+  });
   state.controllerChannelId = interaction.channelId;
   await state.ensureConnection(member, { requireReceive: Boolean(state.recording) });
 
@@ -3328,15 +3482,16 @@ async function handleCommand(interaction) {
       await interaction.reply({ content: "Pong!", ephemeral: true });
       return;
     case "join": {
-      const member = await fetchInteractionMember(interaction);
-      if (!guild || !member?.voice?.channel) {
-        throw new Error("You must join a voice channel first.");
-      }
+      const member = await requireSameVoiceContext(interaction, state, {
+        actionDescription: "make the bot join voice",
+        requireVoiceWhenDisconnected: true,
+      });
       await state.ensureConnection(member, { requireReceive: Boolean(state.recording) });
       await interaction.reply({ content: "Joined your voice channel.", ephemeral: true });
       return;
     }
     case "leave":
+      await requireSameVoiceContext(interaction, state, { actionDescription: "make the bot leave voice" });
       await interaction.deferReply({ ephemeral: true });
       await disconnectGuild(guildId, "Manual leave requested");
       await safeReply(interaction, "Disconnected from voice and cleared playback state.", { ephemeral: true });
@@ -3348,21 +3503,25 @@ async function handleCommand(interaction) {
       await handlePlay(interaction, { next: true });
       return;
     case "skip": {
+      await requireSameVoiceContext(interaction, state, { actionDescription: "skip tracks" });
       const skipped = await state.skip();
       await interaction.reply({ content: skipped ? "Skipped." : "Nothing is playing.", ephemeral: true });
       return;
     }
     case "pause": {
+      await requireSameVoiceContext(interaction, state, { actionDescription: "pause playback" });
       const paused = await state.pause();
       await interaction.reply({ content: paused ? "Paused." : "Nothing is playing.", ephemeral: true });
       return;
     }
     case "resume": {
+      await requireSameVoiceContext(interaction, state, { actionDescription: "resume playback" });
       const resumed = await state.resume();
       await interaction.reply({ content: resumed ? "Resumed." : "Nothing is paused.", ephemeral: true });
       return;
     }
     case "stop":
+      await requireSameVoiceContext(interaction, state, { actionDescription: "stop playback" });
       await state.stopPlayback();
       await interaction.reply({ content: "Stopped.", ephemeral: true });
       return;
@@ -3376,6 +3535,7 @@ async function handleCommand(interaction) {
       return;
     }
     case "shuffle": {
+      await requireSameVoiceContext(interaction, state, { actionDescription: "shuffle the queue" });
       const shuffled = await state.shuffleQueue();
       await interaction.reply({
         content: shuffled ? "Queue shuffled." : "Need at least 2 queued tracks.",
@@ -3384,10 +3544,10 @@ async function handleCommand(interaction) {
       return;
     }
     case "recordstart": {
-      const member = await fetchInteractionMember(interaction);
-      if (!guild || !member?.voice?.channel) {
-        throw new Error("You must join a voice channel first.");
-      }
+      const member = await requireSameVoiceContext(interaction, state, {
+        actionDescription: "start recording",
+        requireVoiceWhenDisconnected: true,
+      });
       if (state.recording) {
         throw new Error("Recording is already active in this guild.");
       }
@@ -3407,6 +3567,7 @@ async function handleCommand(interaction) {
       return;
     }
     case "recordstop": {
+      await requireSameVoiceContext(interaction, state, { actionDescription: "stop recording" });
       if (!state.recording) {
         throw new Error("There is no active recording in this guild.");
       }
@@ -3414,30 +3575,30 @@ async function handleCommand(interaction) {
       await interaction.deferReply();
       const session = state.recording;
       state.recording = null;
-      await finalizeRecording(session);
+      await finalizeRecording(session, guild);
       await state.updateReceiveMode(false);
       await refreshRecordingNickname(guildId);
       await state.refreshState();
-      const audioFiles = await session.audioFiles();
+      const audioFiles = await getSessionDownloadableAudioFiles(session);
       await safeReply(interaction, recordingLinkMessage(session, audioFiles));
       return;
     }
     case "recordlink": {
       await interaction.deferReply({ ephemeral: true });
-      if (state.recording) {
-        await safeReply(interaction, `Recording in progress. Browse recordings at ${downloadBaseUrl}`, { ephemeral: true });
-        return;
-      }
-
-      const latestToken = latestRecordingByGuild.get(guildId);
-      const latest = latestToken ? completedRecordings.get(latestToken) : null;
+      const latest = await findLatestCompletedRecordingForGuild(guildId);
       if (!latest) {
-        throw new Error("No recording is available for this guild.");
+        if (state.recording) {
+          throw new Error("A recording is in progress, but no completed recording is available yet.");
+        }
+        throw new Error("No completed recording is available for this guild.");
       }
 
+      const audioFiles = await getSessionDownloadableAudioFiles(latest);
       await safeReply(
         interaction,
-        `Latest recording available at ${downloadBaseUrl}`,
+        recordingLinkMessage(latest, audioFiles, {
+          prefix: state.recording ? "A recording is in progress. Latest completed recording:" : "Latest recording:",
+        }),
         { ephemeral: true },
       );
       return;
@@ -3472,6 +3633,16 @@ async function handleCommand(interaction) {
 async function handlePlayerButton(interaction, guildId, action) {
   const state = getGuildState(guildId);
   await interaction.deferUpdate();
+
+  try {
+    await requireSameVoiceContext(interaction, state, { actionDescription: "use player controls" });
+  } catch (error) {
+    await interaction.followUp({
+      content: error && error.message ? error.message : "You must be in the same voice channel to use player controls.",
+      ephemeral: true,
+    });
+    return;
+  }
 
   switch (action) {
     case "pause_resume":
@@ -3554,12 +3725,15 @@ client.on("voiceStateUpdate", (oldState, newState) => {
   const recording = state?.recording;
   if (
     recording &&
-    newState.channelId === recording.channelId &&
-    !newState.member?.user?.bot
+    (newState.channelId === recording.channelId || oldState.channelId === recording.channelId) &&
+    !(newState.member?.user?.bot || oldState.member?.user?.bot)
   ) {
-    void recording.subscribeUser(newState.guild, newState.id).catch((error) => {
-      logger.warn(`Recording subscribe error for user ${newState.id} in guild ${guildId}: ${error.message}`);
-    });
+    recording.noteAuthorizedUser(newState.id || oldState.id);
+    if (newState.channelId === recording.channelId) {
+      void recording.subscribeUser(newState.guild, newState.id).catch((error) => {
+        logger.warn(`Recording subscribe error for user ${newState.id} in guild ${guildId}: ${error.message}`);
+      });
+    }
   }
 });
 
@@ -3610,7 +3784,7 @@ async function shutdown(signal = "unknown") {
     if (state.recording) {
       const session = state.recording;
       state.recording = null;
-      await finalizeRecording(session).catch((error) => {
+      await finalizeRecording(session, state.guild).catch((error) => {
         logger.warn(`Failed to finalize recording during shutdown in guild ${state.guildId}: ${error.message}`);
       });
     }
