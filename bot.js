@@ -277,6 +277,29 @@ function spotifySearchQuery(name, artists) {
   return `${name} ${artists.join(" ")} audio`.trim();
 }
 
+function formatDateTime(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "Unknown";
+  }
+  return date.toISOString().replace("T", " ").replace(".000Z", " UTC");
+}
+
+function formatBytes(value) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  const precision = size >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${size.toFixed(precision)} ${units[unitIndex]}`;
+}
+
 function createTrack({
   title,
   webpageUrl,
@@ -486,6 +509,303 @@ class RecordingSession {
       .map((entry) => entry.name)
       .sort();
   }
+}
+
+async function restoreRecordingSessionFromDirectory(directoryPath) {
+  const directoryName = path.basename(directoryPath);
+  const match = directoryName.match(/^(\d+)-(\d+)-([A-Za-z0-9_-]+)$/);
+  if (!match) {
+    return null;
+  }
+
+  const [, guildId, startedMs, token] = match;
+  const startedAt = new Date(Number.parseInt(startedMs, 10));
+  const archivePath = path.join(directoryPath, "session.zip");
+  const archiveStat = await fsp.stat(archivePath).catch(() => null);
+  const directoryStat = await fsp.stat(directoryPath).catch(() => null);
+
+  const session = Object.create(RecordingSession.prototype);
+  session.guildId = guildId;
+  session.channelId = null;
+  session.guildName = null;
+  session.channelName = null;
+  session.startedAt = startedAt;
+  session.completedAt = archiveStat?.mtime || directoryStat?.mtime || startedAt;
+  session.token = token;
+  session.directory = directoryPath;
+  session.archivePath = archiveStat ? archivePath : null;
+  session.receiver = null;
+  session.connection = null;
+  session.speakingListener = null;
+  session.userStreams = new Map();
+  session.fileWriters = new Map();
+  return session;
+}
+
+async function loadStoredCompletedSessions() {
+  const entries = await fsp.readdir(RECORDINGS_DIR, { withFileTypes: true }).catch(() => []);
+  const sessions = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const session = await restoreRecordingSessionFromDirectory(path.join(RECORDINGS_DIR, entry.name));
+    if (!session) {
+      continue;
+    }
+    sessions.push(session);
+  }
+  return sessions;
+}
+
+async function resolveRecordingSession(token) {
+  const active = [...guildStates.values()].map((state) => state.recording).find((item) => item?.token === token);
+  if (active) {
+    return active;
+  }
+
+  const inMemory = completedRecordings.get(token);
+  if (inMemory) {
+    return inMemory;
+  }
+
+  const storedSessions = await loadStoredCompletedSessions();
+  const stored = storedSessions.find((session) => session.token === token);
+  if (stored) {
+    completedRecordings.set(stored.token, stored);
+    return stored;
+  }
+
+  return null;
+}
+
+async function listRecordingSessions() {
+  const storedSessions = await loadStoredCompletedSessions();
+  const merged = new Map();
+
+  for (const session of storedSessions) {
+    merged.set(session.token, session);
+  }
+  for (const session of completedRecordings.values()) {
+    merged.set(session.token, session);
+  }
+  for (const session of [...guildStates.values()].map((state) => state.recording).filter(Boolean)) {
+    merged.set(session.token, session);
+  }
+
+  return [...merged.values()].sort((left, right) => {
+    const leftTime = (left.completedAt || left.startedAt).getTime();
+    const rightTime = (right.completedAt || right.startedAt).getTime();
+    return rightTime - leftTime;
+  });
+}
+
+async function renderRecordingIndexPage() {
+  const sessions = await listRecordingSessions();
+  const rows = await Promise.all(
+    sessions.map(async (session) => {
+      const wavFiles = await session.wavFiles();
+      const wavStats = await Promise.all(
+        wavFiles.map(async (name) => {
+          const filePath = path.join(session.directory, name);
+          const stat = await fsp.stat(filePath).catch(() => null);
+          return { name, size: stat?.size || 0 };
+        }),
+      );
+      const totalSize =
+        wavStats.reduce((sum, file) => sum + file.size, 0) +
+        ((await fsp.stat(session.archivePath).catch(() => null))?.size || 0);
+      const status = session.completedAt ? "Ready" : "Recording";
+      const title = session.guildName || `Guild ${session.guildId}`;
+      const subtitle = [
+        session.channelName ? `Channel ${escapeHtml(session.channelName)}` : `Session ${escapeHtml(session.token.slice(0, 8))}`,
+        `${wavFiles.length} file${wavFiles.length === 1 ? "" : "s"}`,
+        formatBytes(totalSize),
+      ].join(" • ");
+      const fileList = wavStats
+        .slice(0, 4)
+        .map(
+          (file) =>
+            `<a class="file-chip" href="/recordings/${encodeURIComponent(session.token)}/${encodeURIComponent(file.name)}">${escapeHtml(file.name)} <span>${formatBytes(file.size)}</span></a>`,
+        )
+        .join("");
+      const zipLink = session.archivePath
+        ? `<a class="action" href="/recordings/${encodeURIComponent(session.token)}/session.zip">Download ZIP</a>`
+        : "";
+
+      return `
+        <article class="row" data-status="${status.toLowerCase()}" data-sort="${(session.completedAt || session.startedAt).getTime()}" data-label="${escapeHtml(`${title} ${subtitle}`.toLowerCase())}">
+          <div class="row-main">
+            <div class="row-icon">${session.completedAt ? "🗂" : "●"}</div>
+            <div class="row-copy">
+              <h2>${escapeHtml(title)}</h2>
+              <p class="meta">${subtitle}</p>
+              <p class="meta">Started ${escapeHtml(formatDateTime(session.startedAt))}${session.completedAt ? ` • Completed ${escapeHtml(formatDateTime(session.completedAt))}` : ""}</p>
+              <div class="chip-row">${fileList || '<span class="muted">No WAV files captured yet.</span>'}</div>
+            </div>
+          </div>
+          <div class="row-side">
+            <span class="badge badge-${status.toLowerCase()}">${status}</span>
+            <span class="meta">Expires ${escapeHtml(formatDateTime(session.expiresAt()))}</span>
+          </div>
+          <div class="row-actions">
+            <a class="action" href="/recordings/${encodeURIComponent(session.token)}/">Open</a>
+            ${zipLink}
+          </div>
+        </article>
+      `;
+    }),
+  );
+
+  const readyCount = sessions.filter((session) => Boolean(session.completedAt)).length;
+  const liveCount = sessions.length - readyCount;
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Recording Library</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: Inter, system-ui, sans-serif; background: #141c2b; color: #e5eefc; }
+      a { color: inherit; text-decoration: none; }
+      .layout { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
+      .sidebar { padding: 24px 18px; background: #1b2435; border-right: 1px solid #2e3a52; }
+      .brand { display: flex; align-items: center; gap: 12px; font-size: 1.8rem; font-weight: 800; margin-bottom: 24px; }
+      .brand-mark { width: 42px; height: 42px; display: grid; place-items: center; background: linear-gradient(135deg, #facc15, #f59e0b); border-radius: 12px; color: #111827; }
+      .account { padding: 14px 16px; border: 1px solid #3557a6; border-radius: 12px; background: #222d41; margin-bottom: 18px; }
+      .account small { display: block; color: #91a3c7; margin-bottom: 4px; }
+      .account strong { display: block; font-size: 1rem; }
+      .nav { margin-top: 26px; display: grid; gap: 10px; }
+      .nav-item { padding: 11px 12px; border-radius: 10px; color: #dce7fb; background: transparent; border: 1px solid transparent; }
+      .nav-item.active { background: #243149; border-color: #3557a6; }
+      .sidebar-foot { margin-top: 28px; color: #8ea1c4; font-size: 0.92rem; line-height: 1.5; }
+      .content { padding: 8px 14px 18px; }
+      .topbar { margin-top: 8px; background: #1c2638; border: 1px solid #2e3a52; border-radius: 14px; min-height: 48px; display: flex; align-items: center; padding: 0 14px; }
+      .topbar .hamburger { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 8px; background: #3268f0; color: white; font-weight: 700; }
+      .hero { text-align: center; color: #a8bbda; padding: 18px 12px 8px; font-size: 0.95rem; }
+      .hero a { color: #7ab6ff; text-decoration: underline; }
+      .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin: 16px 0 10px; }
+      .toolbar-left { display: flex; gap: 10px; align-items: center; color: #9eb1d1; }
+      .toolbar-right { display: flex; gap: 8px; flex-wrap: wrap; }
+      .control, .action { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 8px 12px; border-radius: 10px; border: 1px solid #3b4d6d; background: #2a364d; color: #eef4ff; cursor: pointer; font: inherit; }
+      .action { background: #2563eb; border-color: #2563eb; }
+      .control.green { background: #16a34a; border-color: #16a34a; }
+      .search { padding: 8px 12px; border-radius: 10px; border: 1px solid #3b4d6d; background: #202b3f; color: #eef4ff; min-width: 220px; }
+      .table { border-top: 1px solid #314158; }
+      .row { display: grid; grid-template-columns: minmax(0, 1fr) 220px 210px; gap: 16px; padding: 18px 8px; border-bottom: 1px solid #314158; align-items: center; }
+      .row-main { display: flex; gap: 14px; min-width: 0; }
+      .row-icon { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; background: #21304a; font-size: 1.1rem; }
+      .row-copy h2 { margin: 0 0 4px; font-size: 1.1rem; font-weight: 700; }
+      .meta { margin: 0 0 4px; color: #9db0d0; font-size: 0.92rem; }
+      .chip-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+      .file-chip { display: inline-flex; gap: 8px; align-items: center; padding: 6px 10px; border-radius: 999px; background: #243149; border: 1px solid #36507d; color: #dfeafe; font-size: 0.88rem; }
+      .file-chip span { color: #9eb1d1; }
+      .row-side { display: grid; gap: 8px; justify-items: end; }
+      .row-actions { display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; }
+      .badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; font-size: 0.84rem; font-weight: 700; }
+      .badge-ready { background: rgba(34,197,94,.18); color: #86efac; }
+      .badge-recording { background: rgba(239,68,68,.18); color: #fca5a5; }
+      .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
+      .stat { background: #1c2638; border: 1px solid #2e3a52; border-radius: 14px; padding: 14px 16px; }
+      .stat small { display: block; color: #90a4c7; margin-bottom: 4px; }
+      .stat strong { font-size: 1.3rem; }
+      .muted { color: #8ea1c4; }
+      .empty { padding: 28px; margin-top: 16px; border-radius: 14px; background: #1c2638; border: 1px dashed #40506d; color: #9fb3d4; }
+      .footer { margin-top: 24px; padding: 16px 8px 0; color: #8ea1c4; font-size: 0.9rem; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; border-top: 1px solid #314158; }
+      @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } .sidebar { display: none; } .row { grid-template-columns: 1fr; } .row-side, .row-actions { justify-items: start; justify-content: flex-start; } .stats { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="brand"><span class="brand-mark">📁</span><span>Recfile</span></div>
+        <div class="account">
+          <small>Library</small>
+          <strong>recording.olavehome.uk</strong>
+        </div>
+        <nav class="nav">
+          <div class="nav-item active">Home</div>
+          <div class="nav-item">Recent Sessions</div>
+          <div class="nav-item">Archives</div>
+          <div class="nav-item">Help</div>
+        </nav>
+        <div class="sidebar-foot">
+          Retention: ${RECORDINGS_TTL_DAYS} days<br>
+          Storage root: ${escapeHtml(RECORDINGS_DIR)}
+        </div>
+      </aside>
+      <main class="content">
+        <div class="topbar"><div class="hamburger">☰</div></div>
+        <div class="hero">Browse recent recordings and choose the session or files you want to download.</div>
+        <section class="stats">
+          <div class="stat"><small>Total sessions</small><strong id="sessionCount">${sessions.length}</strong></div>
+          <div class="stat"><small>Ready downloads</small><strong>${readyCount}</strong></div>
+          <div class="stat"><small>Active captures</small><strong>${liveCount}</strong></div>
+        </section>
+        <section class="toolbar">
+          <div class="toolbar-left"><span>Showing recent sessions</span></div>
+          <div class="toolbar-right">
+            <button class="control green" type="button" onclick="window.location.reload()">Refresh</button>
+            <select id="sortSelect" class="control">
+              <option value="newest">Sort by newest</option>
+              <option value="oldest">Sort by oldest</option>
+              <option value="ready">Ready first</option>
+            </select>
+            <input id="searchInput" class="search" type="search" placeholder="Search sessions or files">
+          </div>
+        </section>
+        ${
+          rows.length > 0
+            ? `<section id="rows" class="table">${rows.join("")}</section>`
+            : '<section class="empty">No recording sessions are available right now.</section>'
+        }
+        <footer class="footer">
+          <span>Home | Terms of Service | Privacy Policy | Contact</span>
+          <span>Olavehome Recordings</span>
+        </footer>
+      </main>
+    </div>
+    <script>
+      const rows = Array.from(document.querySelectorAll('.row'));
+      const searchInput = document.getElementById('searchInput');
+      const sortSelect = document.getElementById('sortSelect');
+      const sessionCount = document.getElementById('sessionCount');
+      const applyFilters = () => {
+        const query = (searchInput?.value || '').trim().toLowerCase();
+        const sort = sortSelect?.value || 'newest';
+        const ordered = rows.slice().sort((a, b) => {
+          if (sort === 'oldest') {
+            return Number(a.dataset.sort) - Number(b.dataset.sort);
+          }
+          if (sort === 'ready') {
+            if (a.dataset.status !== b.dataset.status) {
+              return a.dataset.status === 'ready' ? -1 : 1;
+            }
+          }
+          return Number(b.dataset.sort) - Number(a.dataset.sort);
+        });
+        const container = document.getElementById('rows');
+        if (container) {
+          for (const row of ordered) {
+            const matches = !query || row.dataset.label.includes(query);
+            row.style.display = matches ? '' : 'none';
+            container.appendChild(row);
+          }
+        }
+        if (sessionCount) {
+          sessionCount.textContent = ordered.filter((row) => row.style.display !== 'none').length;
+        }
+      };
+      searchInput?.addEventListener('input', applyFilters);
+      sortSelect?.addEventListener('change', applyFilters);
+      applyFilters();
+    </script>
+  </body>
+</html>`;
 }
 
 async function createZipArchive(directory, destination, wavFiles) {
@@ -1830,13 +2150,14 @@ function startPresenceLoop() {
 
 async function pruneExpiredRecordings() {
   const now = Date.now();
-  for (const [token, session] of completedRecordings.entries()) {
+  const sessions = await listRecordingSessions();
+  for (const session of sessions) {
     if (!session.isExpired(now)) {
       continue;
     }
 
-    completedRecordings.delete(token);
-    if (latestRecordingByGuild.get(session.guildId) === token) {
+    completedRecordings.delete(session.token);
+    if (latestRecordingByGuild.get(session.guildId) === session.token) {
       latestRecordingByGuild.delete(session.guildId);
     }
     await fsp.rm(session.directory, { recursive: true, force: true }).catch(() => {});
@@ -1856,12 +2177,25 @@ function recordingLinkMessage(session, wavFiles) {
 async function startDownloadServer() {
   const app = express();
 
+  app.get("/", async (_, res) => {
+    await pruneExpiredRecordings();
+    res.type("html").send(await renderRecordingIndexPage());
+  });
+
+  app.get("/recordings", async (_, res) => {
+    await pruneExpiredRecordings();
+    res.redirect("/recordings/");
+  });
+
+  app.get("/recordings/", async (_, res) => {
+    await pruneExpiredRecordings();
+    res.type("html").send(await renderRecordingIndexPage());
+  });
+
   app.get("/recordings/:token/", async (req, res) => {
     await pruneExpiredRecordings();
     const token = req.params.token;
-    const session =
-      completedRecordings.get(token) ||
-      [...guildStates.values()].map((state) => state.recording).find((item) => item?.token === token);
+    const session = await resolveRecordingSession(token);
     if (!session) {
       res.status(404).send("Recording session not found");
       return;
@@ -1871,12 +2205,13 @@ async function startDownloadServer() {
     const links = wavFiles
       .map((name) => `<li><a href="${encodeURIComponent(name)}">${escapeHtml(name)}</a></li>`)
       .join("");
-    res.type("html").send(`<html><body><h1>Recording files</h1><ul>${links}</ul></body></html>`);
+    const zipLink = session.archivePath ? `<p><a href="session.zip">Download ZIP</a></p>` : "";
+    res.type("html").send(`<html><body><h1>Recording files</h1>${zipLink}<ul>${links}</ul><p><a href="/recordings/">Back to library</a></p></body></html>`);
   });
 
   app.get("/recordings/:token/session.zip", async (req, res) => {
     await pruneExpiredRecordings();
-    const session = completedRecordings.get(req.params.token);
+    const session = await resolveRecordingSession(req.params.token);
     if (!session?.archivePath) {
       res.status(404).send("Archive not found");
       return;
@@ -1888,9 +2223,7 @@ async function startDownloadServer() {
   app.get("/recordings/:token/:filename", async (req, res) => {
     await pruneExpiredRecordings();
     const token = req.params.token;
-    const session =
-      completedRecordings.get(token) ||
-      [...guildStates.values()].map((state) => state.recording).find((item) => item?.token === token);
+    const session = await resolveRecordingSession(token);
     if (!session) {
       res.status(404).send("Recording session not found");
       return;
