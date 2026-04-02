@@ -97,6 +97,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 - completed recordings expire after 30 days by default
 - set `DOWNLOAD_BASE_URL=https://recording.olavehome.uk` when you put the bot behind your reverse proxy
 - if Discord OAuth is configured, the recordings website can show a `My Sessions` view filtered to sessions that include the signed-in Discord user
+- if Discord OAuth is configured, individual session pages, WAV files, and ZIP downloads are restricted to Discord users who were included in that session
 
 ## Notes
 

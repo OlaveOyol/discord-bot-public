@@ -449,6 +449,68 @@ function discordAvatarUrl(user) {
   return `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.${extension}?size=128`;
 }
 
+async function getSessionParticipantIds(session) {
+  if (Array.isArray(session.participantIds) && session.participantIds.length > 0) {
+    return session.participantIds;
+  }
+  const wavFiles = await session.wavFiles();
+  const participantIds = parseParticipantIdsFromFileNames(wavFiles);
+  session.participantIds = participantIds;
+  return participantIds;
+}
+
+function renderRecordingAccessDeniedPage() {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Access denied</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #141c2b; color: #e5eefc; font-family: Inter, system-ui, sans-serif; }
+      .card { width: min(560px, calc(100vw - 32px)); padding: 28px; border-radius: 18px; background: #1c2638; border: 1px solid #2e3a52; }
+      h1 { margin: 0 0 10px; font-size: 1.5rem; }
+      p { margin: 0 0 14px; color: #a7bbda; line-height: 1.6; }
+      .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+      a { display: inline-flex; align-items: center; justify-content: center; padding: 10px 14px; border-radius: 10px; text-decoration: none; border: 1px solid #3b4d6d; background: #2a364d; color: #eef4ff; }
+      a.primary { background: #2563eb; border-color: #2563eb; }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1>Access denied</h1>
+      <p>This recording is restricted to Discord users who were included in the session.</p>
+      <p>If you believe this is your recording, sign in with the Discord account that was present in voice chat when the recording was captured.</p>
+      <div class="actions">
+        <a class="primary" href="/recordings/mine/">Go to My Sessions</a>
+        <a href="/recordings/">Back to library</a>
+      </div>
+    </main>
+  </body>
+</html>`;
+}
+
+async function requireRecordingAccess(req, res, session) {
+  if (!hasDiscordWebAuth()) {
+    return true;
+  }
+
+  const viewer = getAuthenticatedRecordingUser(req);
+  if (!viewer?.id) {
+    res.redirect(`/auth/discord/login?next=${encodeURIComponent(req.originalUrl || "/recordings/")}`);
+    return false;
+  }
+
+  const participantIds = await getSessionParticipantIds(session);
+  if (!participantIds.includes(viewer.id)) {
+    res.status(403).type("html").send(renderRecordingAccessDeniedPage());
+    return false;
+  }
+
+  return true;
+}
+
 function createTrack({
   title,
   webpageUrl,
@@ -2600,6 +2662,9 @@ async function startDownloadServer() {
       res.status(404).send("Recording session not found");
       return;
     }
+    if (!(await requireRecordingAccess(req, res, session))) {
+      return;
+    }
 
     const wavFiles = await session.wavFiles();
     const links = wavFiles
@@ -2616,6 +2681,9 @@ async function startDownloadServer() {
       res.status(404).send("Archive not found");
       return;
     }
+    if (!(await requireRecordingAccess(req, res, session))) {
+      return;
+    }
 
     res.sendFile(path.resolve(session.archivePath));
   });
@@ -2626,6 +2694,9 @@ async function startDownloadServer() {
     const session = await resolveRecordingSession(token);
     if (!session) {
       res.status(404).send("Recording session not found");
+      return;
+    }
+    if (!(await requireRecordingAccess(req, res, session))) {
       return;
     }
 
