@@ -2506,7 +2506,7 @@ function buildQueueComponents(guildId, page, totalPages) {
   ];
 }
 
-async function refreshPlayerPanel(guildId) {
+async function refreshPlayerPanel(guildId, { repost = false } = {}) {
   const state = getGuildState(guildId);
   const task = Promise.resolve(state.panelRefreshPromise)
     .catch(() => {})
@@ -2531,7 +2531,7 @@ async function refreshPlayerPanel(guildId) {
       };
 
       let message = null;
-      if (state.playerMessageId) {
+      if (state.playerMessageId && !repost) {
         try {
           message = await channel.messages.fetch(state.playerMessageId);
           await message.edit(payload);
@@ -2541,6 +2541,18 @@ async function refreshPlayerPanel(guildId) {
           }
           message = null;
         }
+      }
+
+      if (state.playerMessageId && repost) {
+        try {
+          const previous = await channel.messages.fetch(state.playerMessageId);
+          await previous.delete().catch(() => {});
+        } catch (error) {
+          if (error?.code !== 10008) {
+            logger.warn(`Unable to replace player panel in guild ${guildId}: ${error.message}`);
+          }
+        }
+        state.playerMessageId = null;
       }
 
       if (!message) {
@@ -3281,7 +3293,9 @@ async function handlePlay(interaction, { next = false } = {}) {
       ? `${next ? "Added next" : "Queued"}: ${tracks[0].title}`
       : `${next ? "Queued next batch" : "Queued playlist"} with ${tracks.length} tracks${tracks.length >= PLAYLIST_MAX_TRACKS ? " (capped)" : ""}.`;
   await safeReply(interaction, message);
-  await state.refreshState();
+  await refreshPlayerPanel(guild.id, { repost: true });
+  refreshPresence();
+  void refreshVoiceLifecycle(guild.id);
 }
 
 async function handleCommand(interaction) {
