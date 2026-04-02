@@ -115,9 +115,12 @@ const RECORDING_METADATA_FILE = "session.json";
 const WEB_SESSION_COOKIE_NAME = "recfile_session";
 const OAUTH_STATE_COOKIE_NAME = "recfile_oauth";
 const WEB_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const AUDIO_FILE_EXTENSIONS = new Set([".wav", ".ogg", ".opus", ".mp3", ".m4a", ".aac"]);
+const AUDIO_FILE_EXTENSIONS = new Set([".wav", ".flac", ".ogg", ".opus", ".mp3", ".m4a", ".aac"]);
 const ARCHIVE_AUDIO_EXTENSION = ".ogg";
 const ARCHIVE_AUDIO_BITRATE = env("ARCHIVE_AUDIO_BITRATE", "48k");
+const RECORDING_OUTPUT_FORMAT = ["wav", "flac"].includes(env("RECORDING_OUTPUT_FORMAT", "flac")?.toLowerCase())
+  ? env("RECORDING_OUTPUT_FORMAT", "flac").toLowerCase()
+  : "flac";
 const RECORDING_RESUBSCRIBE_DELAY_MS = Math.max(
   100,
   Number.parseInt(env("RECORDING_RESUBSCRIBE_DELAY_MS", "350"), 10),
@@ -336,7 +339,7 @@ function formatBytes(value) {
 function parseParticipantIdsFromFileNames(fileNames) {
   const ids = new Set();
   for (const fileName of fileNames) {
-    const match = String(fileName).match(/_(\d{15,22})\.(?:wav|ogg|opus|mp3|m4a|aac)$/i);
+    const match = String(fileName).match(/_(\d{15,22})\.(?:wav|flac|ogg|opus|mp3|m4a|aac)$/i);
     if (match) {
       ids.add(match[1]);
     }
@@ -624,6 +627,7 @@ class RecordingSession {
     this.token = crypto.randomBytes(16).toString("base64url");
     this.directory = path.join(RECORDINGS_DIR, `${guildId}-${Date.now()}-${this.token}`);
     this.archivePath = null;
+    this.archived = false;
     this.participantIds = null;
     this.receiver = null;
     this.connection = null;
@@ -776,7 +780,9 @@ class RecordingSession {
     }
 
     this.completedAt = new Date();
-    const audioFiles = await this.audioFiles({ extensions: [".wav"] });
+    await this.optimizeRecentAudioIfNeeded();
+    this.archived = false;
+    const audioFiles = await this.audioFiles();
     if (audioFiles.length > 0) {
       this.archivePath = path.join(this.directory, "session.zip");
       await createZipArchive(this.directory, this.archivePath, audioFiles);
@@ -805,6 +811,37 @@ class RecordingSession {
     return this.audioFiles({ extensions: [".wav"] });
   }
 
+  async optimizeRecentAudioIfNeeded() {
+    if (RECORDING_OUTPUT_FORMAT === "wav") {
+      return;
+    }
+
+    const wavFiles = await this.wavFiles();
+    if (wavFiles.length === 0) {
+      return;
+    }
+
+    const optimizedFiles = [];
+    try {
+      for (const wavFile of wavFiles) {
+        const inputPath = path.join(this.directory, wavFile);
+        const outputName = `${path.basename(wavFile, path.extname(wavFile))}.${RECORDING_OUTPUT_FORMAT}`;
+        const outputPath = path.join(this.directory, outputName);
+        await transcodeAudioFile(inputPath, outputPath, RECORDING_OUTPUT_FORMAT);
+        optimizedFiles.push({ inputPath, outputPath });
+      }
+
+      for (const { inputPath } of optimizedFiles) {
+        await fsp.rm(inputPath, { force: true }).catch(() => {});
+      }
+    } catch (error) {
+      logger.warn(`Failed to optimize recent recording session ${this.token}: ${error.stderr?.trim() || error.message}`);
+      for (const { outputPath } of optimizedFiles) {
+        await fsp.rm(outputPath, { force: true }).catch(() => {});
+      }
+    }
+  }
+
   metadataPath() {
     return path.join(this.directory, RECORDING_METADATA_FILE);
   }
@@ -823,7 +860,7 @@ class RecordingSession {
       participantIds: parseParticipantIdsFromFileNames(audioFiles),
       files: audioFiles,
       recentWindowDays: RECENT_RECORDINGS_DAYS,
-      archived: audioFiles.every((name) => path.extname(name).toLowerCase() !== ".wav"),
+      archived: Boolean(this.archived),
       archiveName: this.archivePath ? path.basename(this.archivePath) : null,
     };
     await fsp.writeFile(this.metadataPath(), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
@@ -859,6 +896,7 @@ async function restoreRecordingSessionFromDirectory(directoryPath) {
   session.token = token;
   session.directory = directoryPath;
   session.archivePath = archiveStat ? archivePath : null;
+  session.archived = Boolean(metadata?.archived);
   session.participantIds = Array.isArray(metadata?.participantIds) ? metadata.participantIds : null;
   session.receiver = null;
   session.connection = null;
@@ -944,7 +982,7 @@ async function summarizeRecordingSession(session) {
       ? [...session.participantIds]
       : parseParticipantIdsFromFileNames(audioFiles);
   session.participantIds = participantIds;
-  const archived = audioFiles.length > 0 && audioFiles.every((name) => path.extname(name).toLowerCase() !== ".wav");
+  const archived = Boolean(session.archived);
 
   return {
     session,
@@ -1036,6 +1074,25 @@ async function createZipArchive(directory, destination, wavFiles) {
   });
 }
 
+async function transcodeAudioFile(inputPath, outputPath, format) {
+  const args = ["-y", "-i", inputPath, "-vn"];
+  switch (format) {
+    case "flac":
+      args.push("-c:a", "flac");
+      break;
+    case "ogg":
+      args.push("-c:a", "libopus", "-b:a", ARCHIVE_AUDIO_BITRATE, "-vbr", "on");
+      break;
+    case "wav":
+      args.push("-c:a", "pcm_s16le");
+      break;
+    default:
+      throw new Error(`Unsupported audio transcode format: ${format}`);
+  }
+  args.push(outputPath);
+  await runFfmpeg(args);
+}
+
 async function runFfmpeg(args) {
   return await new Promise((resolve, reject) => {
     execFile("ffmpeg", args, { windowsHide: true, encoding: "utf8" }, (error, stdout, stderr) => {
@@ -1051,35 +1108,23 @@ async function runFfmpeg(args) {
 }
 
 async function archiveRecordingSessionIfNeeded(session, now = Date.now()) {
-  if (!session.completedAt || session.isExpired(now) || isRecentRecordingSession(session, now)) {
+  if (!session.completedAt || session.isExpired(now) || isRecentRecordingSession(session, now) || session.archived) {
     return;
   }
 
-  const wavFiles = await session.wavFiles();
-  if (wavFiles.length === 0) {
+  const sourceFiles = await session.audioFiles();
+  if (sourceFiles.length === 0) {
     return;
   }
 
-  logger.info(`Archiving recording session ${session.token} with ${wavFiles.length} WAV file(s).`);
+  logger.info(`Archiving recording session ${session.token} with ${sourceFiles.length} audio file(s).`);
   const archivedFiles = [];
   try {
-    for (const wavFile of wavFiles) {
-      const inputPath = path.join(session.directory, wavFile);
-      const outputName = `${path.basename(wavFile, path.extname(wavFile))}${ARCHIVE_AUDIO_EXTENSION}`;
+    for (const sourceFile of sourceFiles) {
+      const inputPath = path.join(session.directory, sourceFile);
+      const outputName = `${path.basename(sourceFile, path.extname(sourceFile))}${ARCHIVE_AUDIO_EXTENSION}`;
       const outputPath = path.join(session.directory, outputName);
-      await runFfmpeg([
-        "-y",
-        "-i",
-        inputPath,
-        "-vn",
-        "-c:a",
-        "libopus",
-        "-b:a",
-        ARCHIVE_AUDIO_BITRATE,
-        "-vbr",
-        "on",
-        outputPath,
-      ]);
+      await transcodeAudioFile(inputPath, outputPath, "ogg");
       archivedFiles.push(outputName);
     }
 
@@ -1087,11 +1132,12 @@ async function archiveRecordingSessionIfNeeded(session, now = Date.now()) {
     await fsp.rm(nextArchivePath, { force: true }).catch(() => {});
     await createZipArchive(session.directory, nextArchivePath, archivedFiles);
 
-    for (const wavFile of wavFiles) {
-      await fsp.rm(path.join(session.directory, wavFile), { force: true }).catch(() => {});
+    for (const sourceFile of sourceFiles) {
+      await fsp.rm(path.join(session.directory, sourceFile), { force: true }).catch(() => {});
     }
 
     session.archivePath = nextArchivePath;
+    session.archived = true;
     await session.writeMetadata();
   } catch (error) {
     logger.warn(`Failed to archive recording session ${session.token}: ${error.stderr?.trim() || error.message}`);
@@ -2437,12 +2483,12 @@ async function pruneExpiredRecordings() {
   }
 }
 
-function recordingLinkMessage(session, wavFiles) {
-  if (wavFiles.length === 0) {
+function recordingLinkMessage(session, audioFiles) {
+  if (audioFiles.length === 0) {
     return "Recording stopped, but no audio files were captured.";
   }
 
-  const links = wavFiles.map((name) => `[${name}](${session.indexUrl()}${encodeURIComponent(name)})`).join(", ");
+  const links = audioFiles.map((name) => `[${name}](${session.indexUrl()}${encodeURIComponent(name)})`).join(", ");
   const zipPart = session.archivePath ? ` | ZIP: [session.zip](${session.zipUrl()})` : "";
   return `Recording saved. Download files: ${links}${zipPart} | Expires: ${session.expiresAt().toISOString()}`;
 }
@@ -2999,8 +3045,8 @@ async function handleCommand(interaction) {
       await finalizeRecording(session);
       await state.updateReceiveMode(false);
       await state.refreshState();
-      const wavFiles = await session.wavFiles();
-      await safeReply(interaction, recordingLinkMessage(session, wavFiles), { ephemeral: true });
+      const audioFiles = await session.audioFiles();
+      await safeReply(interaction, recordingLinkMessage(session, audioFiles), { ephemeral: true });
       return;
     }
     case "recordlink": {

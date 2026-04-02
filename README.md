@@ -52,6 +52,7 @@ This bot can:
 - `RECORDINGS_TTL_DAYS` - recording retention window in days, default `30`, capped at `31`
 - `RECENT_RECORDINGS_DAYS` - recent/archive split window in days, default `7`
 - `ARCHIVE_AUDIO_BITRATE` - ffmpeg bitrate used when older recordings are compressed for archives, default `48k`
+- `RECORDING_OUTPUT_FORMAT` - output format for recent per-user stems, default `flac`, supported: `wav`, `flac`
 - `CLEANUP_INTERVAL_SECONDS` - expired-recording cleanup interval, default `3600`
 - `AFK_DISCONNECT_SECONDS` - idle timeout before leaving voice, default `300`
 - `RECORDING_RESUBSCRIBE_DELAY_MS` - delay before retrying a speaker stream after a bad packet/decode error, default `350`
@@ -95,7 +96,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 ## Recording
 
 - recording captures incoming user voice only
-- each speaker is written to a separate WAV file
+- each speaker is written to a separate aligned stem, stored as `flac` by default to reduce size
 - per-user stems now preserve silence so their timing lines up naturally against the same session clock
 - `/recordstop` returns individual file links and a ZIP archive when audio was captured
 - completed recordings expire after 30 days by default
