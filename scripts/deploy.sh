@@ -44,6 +44,7 @@ if [ ! -d "$APP_DIR/.git" ]; then
   git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
 fi
 
+git config --global --add safe.directory "$APP_DIR"
 git -C "$APP_DIR" fetch --prune origin
 git -C "$APP_DIR" checkout "$BRANCH"
 git -C "$APP_DIR" reset --hard "origin/$BRANCH"
