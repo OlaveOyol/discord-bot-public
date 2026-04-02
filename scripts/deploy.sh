@@ -8,6 +8,7 @@ SERVICE_NAME="${SERVICE_NAME:-discord-bot}"
 BRANCH="${BRANCH:-main}"
 REPO_URL="${REPO_URL:-}"
 RECORDINGS_DIR="${RECORDINGS_DIR:-/var/lib/discord-bot/recordings}"
+SHARED_DIR="${SHARED_DIR:-$APP_DIR/shared}"
 LOCK_FILE="${LOCK_FILE:-/tmp/discord-bot-deploy.lock}"
 
 exec 9>"$LOCK_FILE"
@@ -66,6 +67,7 @@ fi
 
 install -d -m 0755 "$APP_DIR"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0755 "$RECORDINGS_DIR"
+install -d -o "$APP_USER" -g "$APP_GROUP" -m 0755 "$SHARED_DIR"
 
 if [ ! -d "$APP_DIR/.git" ]; then
   if [ -z "$REPO_URL" ]; then
@@ -93,10 +95,40 @@ fi
 
 chown -R "$APP_USER:$APP_GROUP" "$APP_DIR"
 chown -R "$APP_USER:$APP_GROUP" "$RECORDINGS_DIR"
+chown -R "$APP_USER:$APP_GROUP" "$SHARED_DIR"
 
-if [ ! -f "$APP_DIR/.env" ]; then
-  echo "Warning: $APP_DIR/.env does not exist yet." >&2
+if [ -f "$APP_DIR/.env" ] && [ ! -f "$SHARED_DIR/.env" ]; then
+  cp "$APP_DIR/.env" "$SHARED_DIR/.env"
+  chown "$APP_USER:$APP_GROUP" "$SHARED_DIR/.env"
 fi
 
-systemctl restart "$SERVICE_NAME"
+if [ ! -f "$SHARED_DIR/.env" ]; then
+  echo "Warning: $SHARED_DIR/.env does not exist yet." >&2
+fi
+
+build_id="$(git -C "$APP_DIR" rev-parse --short=12 HEAD)"
+package_result="$(node "$APP_DIR/deploy/scripts/package-release.js" --build-id "$build_id" --output-dir "$APP_DIR/staging/artifacts")"
+manifest_path="$(printf '%s' "$package_result" | node -e "const fs=require('node:fs'); const data=JSON.parse(fs.readFileSync(0,'utf8')); process.stdout.write(data.manifestPath);")"
+supervisor_token=""
+if [ -f "$SHARED_DIR/.env" ]; then
+  supervisor_token="$(node -e "const fs=require('node:fs'); const file=process.argv[1]; const lines=fs.readFileSync(file,'utf8').split(/\r?\n/); for (const line of lines) { if (!line || line.trim().startsWith('#')) continue; const idx=line.indexOf('='); if (idx <= 0) continue; const key=line.slice(0, idx).trim(); if (key !== 'SUPERVISOR_TOKEN') continue; const value=line.slice(idx + 1).trim().replace(/^['\"]|['\"]$/g, ''); if (value) process.stdout.write(value); break; }" "$SHARED_DIR/.env")"
+fi
+
+ota_apply_args=(
+  apply
+  --manifest "$manifest_path"
+  --app-dir "$APP_DIR"
+  --service-name "$SERVICE_NAME"
+  --app-user "$APP_USER"
+  --app-group "$APP_GROUP"
+  --legacy-env-path "$APP_DIR/.env"
+)
+
+if [ -n "$supervisor_token" ]; then
+  ota_apply_args+=(--supervisor-token "$supervisor_token")
+fi
+
+node "$APP_DIR/deploy/scripts/ota-supervisor.js" \
+  "${ota_apply_args[@]}"
+
 systemctl --no-pager --full status "$SERVICE_NAME" || true
