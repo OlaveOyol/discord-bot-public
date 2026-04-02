@@ -88,6 +88,7 @@ When you run `/play`, the bot creates or refreshes one player panel in that text
 - `Previous`
 - `Skip`
 - `Stop`
+- `Shuffle`
 - `Show Queue` or `Hide Queue`
 
 The panel is re-posted on refresh so it stays near the bottom of the channel, which is the closest Discord allows to a sticky bottom panel.
@@ -107,6 +108,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 - if Discord OAuth is configured, individual session pages, WAV files, and ZIP downloads are restricted to Discord users who were included in that session
 - the recorder now tolerates isolated decode failures by resubscribing the affected speaker stream instead of dropping that user for the rest of the recording
 - speaker subscriptions now stay open for the whole recording session, so a user can go silent and speak again without losing their stem
+- while recording is active, the bot adds a red recording-light suffix to its guild nickname and restores the previous nickname when recording ends
 
 ## Notes
 

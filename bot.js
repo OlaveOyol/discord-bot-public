@@ -72,6 +72,7 @@ const DOWNLOAD_PORT_SEARCH_ATTEMPTS = Math.max(
 );
 const RECORDINGS_DIR = env("RECORDINGS_DIR", path.join(os.tmpdir(), "discord-bot-recordings"));
 const PLAYBACK_STATE_PATH = env("PLAYBACK_STATE_PATH", path.join(RECORDINGS_DIR, "_playback-state.json"));
+const RECORDING_NICKNAME_INDICATOR = " 🔴";
 const RECORDINGS_TTL_DAYS = Math.min(31, Math.max(1, Number.parseInt(env("RECORDINGS_TTL_DAYS", "30"), 10)));
 const RECENT_RECORDINGS_DAYS = Math.min(
   RECORDINGS_TTL_DAYS,
@@ -344,6 +345,19 @@ function formatDuration(seconds) {
   }
 
   return `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function trimRecordingIndicator(text) {
+  return String(text || "").endsWith(RECORDING_NICKNAME_INDICATOR)
+    ? String(text).slice(0, -RECORDING_NICKNAME_INDICATOR.length)
+    : String(text || "");
+}
+
+function buildRecordingNickname(baseName) {
+  const base = trimRecordingIndicator(baseName).trim();
+  const source = base || client.user?.username || "Recorder";
+  const maxBaseLength = Math.max(1, 32 - RECORDING_NICKNAME_INDICATOR.length);
+  return `${source.slice(0, maxBaseLength)}${RECORDING_NICKNAME_INDICATOR}`;
 }
 
 function sanitizeFilename(value) {
@@ -1285,6 +1299,7 @@ class GuildState {
     this.deferPanelRefresh = false;
     this.currentOffsetMs = 0;
     this.playbackStartedAtMs = null;
+    this.baseNickname = undefined;
     this.player = createAudioPlayer({
       behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
     });
@@ -2393,6 +2408,11 @@ function buildPlayerComponents(state) {
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
+        .setCustomId(`player:${state.guildId}:shuffle`)
+        .setLabel("Shuffle")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(state.queue.length < 2),
+      new ButtonBuilder()
         .setCustomId(`player:${state.guildId}:queue_toggle`)
         .setLabel(queueToggleLabel)
         .setStyle(ButtonStyle.Secondary)
@@ -2568,12 +2588,59 @@ async function disconnectGuild(guildId, reason) {
       connection.destroy();
     }
     state.connection = null;
+    await refreshRecordingNickname(guildId);
     refreshPresence();
     logger.info(`${reason} in guild ${guildId}`);
   } finally {
     state.disconnecting = false;
     await refreshPlayerPanel(guildId).catch(() => {});
   }
+}
+
+async function refreshRecordingNickname(guildId) {
+  const guild = client.guilds.cache.get(guildId);
+  const state = getGuildState(guildId);
+  if (!guild || !client.user) {
+    return;
+  }
+
+  const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+  if (!me?.manageable) {
+    return;
+  }
+
+  const currentNickname = me.nickname;
+  if (state.recording) {
+    if (state.baseNickname === undefined) {
+      state.baseNickname = currentNickname === null ? null : trimRecordingIndicator(currentNickname);
+    }
+    const targetNickname = buildRecordingNickname(state.baseNickname ?? currentNickname ?? "");
+    if (currentNickname === targetNickname) {
+      return;
+    }
+    await me.setNickname(targetNickname, "Recording active").catch((error) => {
+      logger.warn(`Failed to set recording nickname in guild ${guildId}: ${error.message}`);
+    });
+    return;
+  }
+
+  if (state.baseNickname === undefined) {
+    if (currentNickname && currentNickname.endsWith(RECORDING_NICKNAME_INDICATOR)) {
+      state.baseNickname = trimRecordingIndicator(currentNickname);
+    } else {
+      return;
+    }
+  }
+
+  const restoreNickname = state.baseNickname || null;
+  if ((currentNickname || null) === restoreNickname) {
+    state.baseNickname = undefined;
+    return;
+  }
+  await me.setNickname(restoreNickname, "Recording inactive").catch((error) => {
+    logger.warn(`Failed to restore nickname in guild ${guildId}: ${error.message}`);
+  });
+  state.baseNickname = undefined;
 }
 
 async function refreshVoiceLifecycle(guildId) {
@@ -3233,6 +3300,7 @@ async function handleCommand(interaction) {
       session.channelName = member.voice.channel.name;
       session.attach(connection, guild);
       state.recording = session;
+      await refreshRecordingNickname(guildId);
       await state.refreshState();
       await safeReply(interaction, `Recording started. Browse recordings at ${downloadBaseUrl}`);
       return;
@@ -3247,6 +3315,7 @@ async function handleCommand(interaction) {
       state.recording = null;
       await finalizeRecording(session);
       await state.updateReceiveMode(false);
+      await refreshRecordingNickname(guildId);
       await state.refreshState();
       const audioFiles = await session.audioFiles();
       await safeReply(interaction, recordingLinkMessage(session, audioFiles));
@@ -3319,6 +3388,9 @@ async function handlePlayerButton(interaction, guildId, action) {
       return;
     case "stop":
       await state.stopPlayback();
+      return;
+    case "shuffle":
+      await state.shuffleQueue();
       return;
     case "queue_toggle":
       state.panelQueueVisible = !state.panelQueueVisible;
