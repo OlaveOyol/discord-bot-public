@@ -13,6 +13,13 @@ const express = require("express");
 const play = require("play-dl");
 const prism = require("prism-media");
 const {
+  renderRecordingAccessDeniedPage,
+  renderRecordingsHelpPage,
+  renderRecordingsHomePage,
+  renderRecordingsListPage,
+  renderRecordingSessionPage,
+} = require("./recordings-web");
+const {
   ActionRowBuilder,
   ActivityType,
   ButtonBuilder,
@@ -65,6 +72,10 @@ const DOWNLOAD_PORT_SEARCH_ATTEMPTS = Math.max(
 );
 const RECORDINGS_DIR = env("RECORDINGS_DIR", path.join(os.tmpdir(), "discord-bot-recordings"));
 const RECORDINGS_TTL_DAYS = Math.min(31, Math.max(1, Number.parseInt(env("RECORDINGS_TTL_DAYS", "30"), 10)));
+const RECENT_RECORDINGS_DAYS = Math.min(
+  RECORDINGS_TTL_DAYS,
+  Math.max(1, Number.parseInt(env("RECENT_RECORDINGS_DAYS", "7"), 10)),
+);
 const CLEANUP_INTERVAL_SECONDS = Math.max(
   60,
   Number.parseInt(env("CLEANUP_INTERVAL_SECONDS", "3600"), 10),
@@ -97,12 +108,16 @@ const SPOTIFY_TITLE_RE = /<meta property="og:title" content="([^"]+)"/i;
 const SPOTIFY_DESC_RE = /<meta property="og:description" content="([^"]+)"/i;
 const SPOTIFY_INITIAL_STATE_RE = /<script id="initialState" type="text\/plain">(.*?)<\/script>/is;
 const RECORDINGS_TTL_MS = RECORDINGS_TTL_DAYS * 24 * 60 * 60 * 1000;
+const RECENT_RECORDINGS_MS = RECENT_RECORDINGS_DAYS * 24 * 60 * 60 * 1000;
 const LOCAL_YTDLP_PATH = path.join(BOT_DIR, ".venv", "Scripts", "yt-dlp.exe");
 const INSTANCE_LOCK_PATH = path.join(BOT_DIR, ".bot.lock");
 const RECORDING_METADATA_FILE = "session.json";
 const WEB_SESSION_COOKIE_NAME = "recfile_session";
 const OAUTH_STATE_COOKIE_NAME = "recfile_oauth";
 const WEB_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const AUDIO_FILE_EXTENSIONS = new Set([".wav", ".ogg", ".opus", ".mp3", ".m4a", ".aac"]);
+const ARCHIVE_AUDIO_EXTENSION = ".ogg";
+const ARCHIVE_AUDIO_BITRATE = env("ARCHIVE_AUDIO_BITRATE", "48k");
 
 let spotifyTokenCache = null;
 let downloadBaseUrl = DOWNLOAD_BASE_URL;
@@ -311,12 +326,20 @@ function formatBytes(value) {
 function parseParticipantIdsFromFileNames(fileNames) {
   const ids = new Set();
   for (const fileName of fileNames) {
-    const match = String(fileName).match(/_(\d{15,22})\.wav$/i);
+    const match = String(fileName).match(/_(\d{15,22})\.(?:wav|ogg|opus|mp3|m4a|aac)$/i);
     if (match) {
       ids.add(match[1]);
     }
   }
   return [...ids].sort();
+}
+
+function getSessionReferenceTime(session) {
+  return session.completedAt || session.startedAt;
+}
+
+function isRecentRecordingSession(session, now = Date.now()) {
+  return now - getSessionReferenceTime(session).getTime() < RECENT_RECORDINGS_MS;
 }
 
 function hasDiscordWebAuth() {
@@ -453,42 +476,10 @@ async function getSessionParticipantIds(session) {
   if (Array.isArray(session.participantIds) && session.participantIds.length > 0) {
     return session.participantIds;
   }
-  const wavFiles = await session.wavFiles();
-  const participantIds = parseParticipantIdsFromFileNames(wavFiles);
+  const audioFiles = await session.audioFiles();
+  const participantIds = parseParticipantIdsFromFileNames(audioFiles);
   session.participantIds = participantIds;
   return participantIds;
-}
-
-function renderRecordingAccessDeniedPage() {
-  return `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Access denied</title>
-    <style>
-      :root { color-scheme: dark; }
-      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #141c2b; color: #e5eefc; font-family: Inter, system-ui, sans-serif; }
-      .card { width: min(560px, calc(100vw - 32px)); padding: 28px; border-radius: 18px; background: #1c2638; border: 1px solid #2e3a52; }
-      h1 { margin: 0 0 10px; font-size: 1.5rem; }
-      p { margin: 0 0 14px; color: #a7bbda; line-height: 1.6; }
-      .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
-      a { display: inline-flex; align-items: center; justify-content: center; padding: 10px 14px; border-radius: 10px; text-decoration: none; border: 1px solid #3b4d6d; background: #2a364d; color: #eef4ff; }
-      a.primary { background: #2563eb; border-color: #2563eb; }
-    </style>
-  </head>
-  <body>
-    <main class="card">
-      <h1>Access denied</h1>
-      <p>This recording is restricted to Discord users who were included in the session.</p>
-      <p>If you believe this is your recording, sign in with the Discord account that was present in voice chat when the recording was captured.</p>
-      <div class="actions">
-        <a class="primary" href="/recordings/mine/">Go to My Sessions</a>
-        <a href="/recordings/">Back to library</a>
-      </div>
-    </main>
-  </body>
-</html>`;
 }
 
 async function requireRecordingAccess(req, res, session) {
@@ -709,20 +700,33 @@ class RecordingSession {
     }
 
     this.completedAt = new Date();
-    const wavFiles = await this.wavFiles();
-    if (wavFiles.length > 0) {
+    const audioFiles = await this.audioFiles({ extensions: [".wav"] });
+    if (audioFiles.length > 0) {
       this.archivePath = path.join(this.directory, "session.zip");
-      await createZipArchive(this.directory, this.archivePath, wavFiles);
+      await createZipArchive(this.directory, this.archivePath, audioFiles);
     }
     await this.writeMetadata();
   }
 
-  async wavFiles() {
+  async audioFiles({ extensions = null } = {}) {
     const entries = await fsp.readdir(this.directory, { withFileTypes: true }).catch(() => []);
     return entries
-      .filter((entry) => entry.isFile() && entry.name.endsWith(".wav"))
+      .filter((entry) => {
+        if (!entry.isFile()) {
+          return false;
+        }
+        const extension = path.extname(entry.name).toLowerCase();
+        if (extensions) {
+          return extensions.includes(extension);
+        }
+        return AUDIO_FILE_EXTENSIONS.has(extension);
+      })
       .map((entry) => entry.name)
       .sort();
+  }
+
+  async wavFiles() {
+    return this.audioFiles({ extensions: [".wav"] });
   }
 
   metadataPath() {
@@ -730,7 +734,7 @@ class RecordingSession {
   }
 
   async writeMetadata() {
-    const wavFiles = await this.wavFiles();
+    const audioFiles = await this.audioFiles();
     const payload = {
       version: 1,
       token: this.token,
@@ -740,8 +744,10 @@ class RecordingSession {
       channelName: this.channelName || null,
       startedAt: this.startedAt.toISOString(),
       completedAt: this.completedAt ? this.completedAt.toISOString() : null,
-      participantIds: parseParticipantIdsFromFileNames(wavFiles),
-      files: wavFiles,
+      participantIds: parseParticipantIdsFromFileNames(audioFiles),
+      files: audioFiles,
+      recentWindowDays: RECENT_RECORDINGS_DAYS,
+      archived: audioFiles.every((name) => path.extname(name).toLowerCase() !== ".wav"),
       archiveName: this.archivePath ? path.basename(this.archivePath) : null,
     };
     await fsp.writeFile(this.metadataPath(), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
@@ -846,9 +852,9 @@ async function listRecordingSessions() {
 }
 
 async function summarizeRecordingSession(session) {
-  const wavFiles = await session.wavFiles();
-  const wavStats = await Promise.all(
-    wavFiles.map(async (name) => {
+  const audioFiles = await session.audioFiles();
+  const audioStats = await Promise.all(
+    audioFiles.map(async (name) => {
       const filePath = path.join(session.directory, name);
       const stat = await fsp.stat(filePath).catch(() => null);
       return { name, size: stat?.size || 0 };
@@ -858,280 +864,80 @@ async function summarizeRecordingSession(session) {
   const participantIds =
     Array.isArray(session.participantIds) && session.participantIds.length > 0
       ? [...session.participantIds]
-      : parseParticipantIdsFromFileNames(wavFiles);
+      : parseParticipantIdsFromFileNames(audioFiles);
   session.participantIds = participantIds;
+  const archived = audioFiles.length > 0 && audioFiles.every((name) => path.extname(name).toLowerCase() !== ".wav");
 
   return {
     session,
-    wavFiles,
-    wavStats,
+    audioFiles,
+    audioStats,
     archiveSize,
     participantIds,
-    totalSize: wavStats.reduce((sum, file) => sum + file.size, 0) + archiveSize,
+    totalSize: audioStats.reduce((sum, file) => sum + file.size, 0) + archiveSize,
     status: session.completedAt ? "Ready" : "Recording",
     title: session.guildName || `Guild ${session.guildId}`,
     subtitle: [
       session.channelName ? `Channel ${session.channelName}` : `Session ${session.token.slice(0, 8)}`,
-      `${wavFiles.length} file${wavFiles.length === 1 ? "" : "s"}`,
+      `${audioFiles.length} file${audioFiles.length === 1 ? "" : "s"}`,
     ].join(" • "),
+    archived,
   };
 }
 
-function renderLibraryPage({
-  currentPath,
-  accountCard,
-  heroText,
-  toolbarLabel,
-  sessionCountLabel,
-  readyCount,
-  liveCount,
-  rowsMarkup,
-  emptyMarkup,
-}) {
-  return `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Recording Library</title>
-    <style>
-      :root { color-scheme: dark; }
-      * { box-sizing: border-box; }
-      body { margin: 0; font-family: Inter, system-ui, sans-serif; background: #141c2b; color: #e5eefc; }
-      a { color: inherit; text-decoration: none; }
-      .layout { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
-      .sidebar { padding: 24px 18px; background: #1b2435; border-right: 1px solid #2e3a52; }
-      .brand { display: flex; align-items: center; gap: 12px; font-size: 1.8rem; font-weight: 800; margin-bottom: 24px; }
-      .brand-mark { width: 42px; height: 42px; display: grid; place-items: center; background: linear-gradient(135deg, #facc15, #f59e0b); border-radius: 12px; color: #111827; }
-      .account { padding: 14px 16px; border: 1px solid #3557a6; border-radius: 12px; background: #222d41; margin-bottom: 18px; }
-      .account-user { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
-      .avatar { width: 42px; height: 42px; border-radius: 50%; background: linear-gradient(135deg, #4f46e5, #06b6d4); background-size: cover; background-position: center; display: inline-block; }
-      .account small { display: block; color: #91a3c7; margin-bottom: 4px; }
-      .account strong { display: block; font-size: 1rem; }
-      .account-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
-      .nav { margin-top: 26px; display: grid; gap: 10px; }
-      .nav-item { display: block; padding: 11px 12px; border-radius: 10px; color: #dce7fb; background: transparent; border: 1px solid transparent; }
-      .nav-item.active { background: #243149; border-color: #3557a6; }
-      .sidebar-foot { margin-top: 28px; color: #8ea1c4; font-size: 0.92rem; line-height: 1.5; }
-      .content { padding: 8px 14px 18px; }
-      .topbar { margin-top: 8px; background: #1c2638; border: 1px solid #2e3a52; border-radius: 14px; min-height: 48px; display: flex; align-items: center; padding: 0 14px; }
-      .topbar .hamburger { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 8px; background: #3268f0; color: white; font-weight: 700; }
-      .hero { text-align: center; color: #a8bbda; padding: 18px 12px 8px; font-size: 0.95rem; }
-      .hero a { color: #7ab6ff; text-decoration: underline; }
-      .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin: 16px 0 10px; }
-      .toolbar-left { display: flex; gap: 10px; align-items: center; color: #9eb1d1; }
-      .toolbar-right { display: flex; gap: 8px; flex-wrap: wrap; }
-      .control, .action { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 8px 12px; border-radius: 10px; border: 1px solid #3b4d6d; background: #2a364d; color: #eef4ff; cursor: pointer; font: inherit; }
-      .action { background: #2563eb; border-color: #2563eb; }
-      .control.green { background: #16a34a; border-color: #16a34a; }
-      .search { padding: 8px 12px; border-radius: 10px; border: 1px solid #3b4d6d; background: #202b3f; color: #eef4ff; min-width: 220px; }
-      .table { border-top: 1px solid #314158; }
-      .row { display: grid; grid-template-columns: minmax(0, 1fr) 220px 210px; gap: 16px; padding: 18px 8px; border-bottom: 1px solid #314158; align-items: center; }
-      .row-main { display: flex; gap: 14px; min-width: 0; }
-      .row-icon { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; background: #21304a; font-size: 1.1rem; }
-      .row-copy h2 { margin: 0 0 4px; font-size: 1.1rem; font-weight: 700; }
-      .meta { margin: 0 0 4px; color: #9db0d0; font-size: 0.92rem; }
-      .chip-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
-      .file-chip { display: inline-flex; gap: 8px; align-items: center; padding: 6px 10px; border-radius: 999px; background: #243149; border: 1px solid #36507d; color: #dfeafe; font-size: 0.88rem; }
-      .file-chip span { color: #9eb1d1; }
-      .row-side { display: grid; gap: 8px; justify-items: end; }
-      .row-actions { display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; }
-      .badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; font-size: 0.84rem; font-weight: 700; }
-      .badge-ready { background: rgba(34,197,94,.18); color: #86efac; }
-      .badge-recording { background: rgba(239,68,68,.18); color: #fca5a5; }
-      .badge-match { background: rgba(59,130,246,.18); color: #93c5fd; }
-      .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
-      .stat { background: #1c2638; border: 1px solid #2e3a52; border-radius: 14px; padding: 14px 16px; }
-      .stat small { display: block; color: #90a4c7; margin-bottom: 4px; }
-      .stat strong { font-size: 1.3rem; }
-      .muted { color: #8ea1c4; }
-      .empty { padding: 28px; margin-top: 16px; border-radius: 14px; background: #1c2638; border: 1px dashed #40506d; color: #9fb3d4; }
-      .footer { margin-top: 24px; padding: 16px 8px 0; color: #8ea1c4; font-size: 0.9rem; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; border-top: 1px solid #314158; }
-      @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } .sidebar { display: none; } .row { grid-template-columns: 1fr; } .row-side, .row-actions { justify-items: start; justify-content: flex-start; } .stats { grid-template-columns: 1fr; } }
-    </style>
-  </head>
-  <body>
-    <div class="layout">
-      <aside class="sidebar">
-        <div class="brand"><span class="brand-mark">📁</span><span>Recfile</span></div>
-        ${accountCard}
-        <nav class="nav">
-          <a class="nav-item${currentPath === "/recordings/" ? " active" : ""}" href="/recordings/">Home</a>
-          <a class="nav-item${currentPath === "/recordings/mine/" ? " active" : ""}" href="/recordings/mine/">My Sessions</a>
-          <a class="nav-item" href="/recordings/">Recent Sessions</a>
-          <a class="nav-item" href="/recordings/">Archives</a>
-          <a class="nav-item" href="/recordings/">Help</a>
-        </nav>
-        <div class="sidebar-foot">
-          Retention: ${RECORDINGS_TTL_DAYS} days<br>
-          Storage root: ${escapeHtml(RECORDINGS_DIR)}
-        </div>
-      </aside>
-      <main class="content">
-        <div class="topbar"><div class="hamburger">☰</div></div>
-        <div class="hero">${heroText}</div>
-        <section class="stats">
-          <div class="stat"><small>${sessionCountLabel}</small><strong id="sessionCount">${rowsMarkup ? rowsMarkup.sessionCount : 0}</strong></div>
-          <div class="stat"><small>Ready downloads</small><strong>${readyCount}</strong></div>
-          <div class="stat"><small>Active captures</small><strong>${liveCount}</strong></div>
-        </section>
-        <section class="toolbar">
-          <div class="toolbar-left"><span>${toolbarLabel}</span></div>
-          <div class="toolbar-right">
-            <button class="control green" type="button" onclick="window.location.reload()">Refresh</button>
-            <select id="sortSelect" class="control">
-              <option value="newest">Sort by newest</option>
-              <option value="oldest">Sort by oldest</option>
-              <option value="ready">Ready first</option>
-            </select>
-            <input id="searchInput" class="search" type="search" placeholder="Search sessions or files">
-          </div>
-        </section>
-        ${rowsMarkup ? `<section id="rows" class="table">${rowsMarkup.rows}</section>` : emptyMarkup}
-        <footer class="footer">
-          <span>Home | Terms of Service | Privacy Policy | Contact</span>
-          <span>Olavehome Recordings</span>
-        </footer>
-      </main>
-    </div>
-    <script>
-      const rows = Array.from(document.querySelectorAll('.row'));
-      const searchInput = document.getElementById('searchInput');
-      const sortSelect = document.getElementById('sortSelect');
-      const sessionCount = document.getElementById('sessionCount');
-      const applyFilters = () => {
-        const query = (searchInput?.value || '').trim().toLowerCase();
-        const sort = sortSelect?.value || 'newest';
-        const ordered = rows.slice().sort((a, b) => {
-          if (sort === 'oldest') {
-            return Number(a.dataset.sort) - Number(b.dataset.sort);
-          }
-          if (sort === 'ready') {
-            if (a.dataset.status !== b.dataset.status) {
-              return a.dataset.status === 'ready' ? -1 : 1;
-            }
-          }
-          return Number(b.dataset.sort) - Number(a.dataset.sort);
-        });
-        const container = document.getElementById('rows');
-        if (container) {
-          for (const row of ordered) {
-            const matches = !query || row.dataset.label.includes(query);
-            row.style.display = matches ? '' : 'none';
-            container.appendChild(row);
-          }
-        }
-        if (sessionCount) {
-          sessionCount.textContent = ordered.filter((row) => row.style.display !== 'none').length;
-        }
-      };
-      searchInput?.addEventListener('input', applyFilters);
-      sortSelect?.addEventListener('change', applyFilters);
-      applyFilters();
-    </script>
-  </body>
-</html>`;
+function buildViewerModel(viewer) {
+  if (!viewer?.id) {
+    return null;
+  }
+  return {
+    id: viewer.id,
+    username: viewer.username || viewer.id,
+    displayName: viewer.global_name || viewer.globalName || viewer.username || viewer.id,
+    avatarUrl: discordAvatarUrl(viewer),
+  };
 }
 
-async function renderRecordingIndexPage({
-  viewer = null,
-  onlyParticipantId = null,
-  currentPath = "/recordings/",
-  showMinePrompt = false,
-} = {}) {
-  const summaries = (await Promise.all((await listRecordingSessions()).map((session) => summarizeRecordingSession(session))))
-    .filter((summary) => !onlyParticipantId || summary.participantIds.includes(onlyParticipantId));
+async function loadRecordingSummaries() {
+  return Promise.all((await listRecordingSessions()).map((session) => summarizeRecordingSession(session)));
+}
 
-  const rows = summaries.map((summary) => {
-    const { session, wavStats, totalSize, status, title, subtitle, participantIds } = summary;
-    const viewerIncluded = Boolean(viewer?.id && participantIds.includes(viewer.id));
-    const fileList = wavStats
-      .slice(0, 4)
-      .map(
-        (file) =>
-          `<a class="file-chip" href="/recordings/${encodeURIComponent(session.token)}/${encodeURIComponent(file.name)}">${escapeHtml(file.name)} <span>${formatBytes(file.size)}</span></a>`,
-      )
-      .join("");
-    const zipLink = session.archivePath
-      ? `<a class="action" href="/recordings/${encodeURIComponent(session.token)}/session.zip">Download ZIP</a>`
-      : "";
+function isArchivedRecordingSummary(summary, now = Date.now()) {
+  return Boolean(summary.session.completedAt) && !isRecentRecordingSession(summary.session, now);
+}
 
-    return `
-      <article class="row" data-status="${status.toLowerCase()}" data-sort="${(session.completedAt || session.startedAt).getTime()}" data-label="${escapeHtml(`${title} ${subtitle} ${wavStats.map((file) => file.name).join(" ")}`.toLowerCase())}">
-        <div class="row-main">
-          <div class="row-icon">${session.completedAt ? "🗂" : "●"}</div>
-          <div class="row-copy">
-            <h2>${escapeHtml(title)}</h2>
-            <p class="meta">${escapeHtml(subtitle)} • ${formatBytes(totalSize)}</p>
-            <p class="meta">Started ${escapeHtml(formatDateTime(session.startedAt))}${session.completedAt ? ` • Completed ${escapeHtml(formatDateTime(session.completedAt))}` : ""}</p>
-            <div class="chip-row">${fileList || '<span class="muted">No WAV files captured yet.</span>'}</div>
-          </div>
-        </div>
-        <div class="row-side">
-          <span class="badge badge-${status.toLowerCase()}">${status}</span>
-          ${viewerIncluded ? '<span class="badge badge-match">Includes you</span>' : ""}
-          <span class="meta">Expires ${escapeHtml(formatDateTime(session.expiresAt()))}</span>
-        </div>
-        <div class="row-actions">
-          <a class="action" href="/recordings/${encodeURIComponent(session.token)}/">Open</a>
-          ${zipLink}
-        </div>
-      </article>
-    `;
-  });
+function buildRecordingStats(summaries, viewerId = null, now = Date.now()) {
+  const total = summaries.length;
+  const recent = summaries.filter((summary) => isRecentRecordingSession(summary.session, now)).length;
+  const archived = summaries.filter((summary) => isArchivedRecordingSummary(summary, now)).length;
+  const active = summaries.filter((summary) => !summary.session.completedAt).length;
+  const mine = viewerId
+    ? summaries.filter((summary) => summary.participantIds.includes(viewerId)).length
+    : null;
 
-  const readyCount = summaries.filter((summary) => Boolean(summary.session.completedAt)).length;
-  const liveCount = summaries.length - readyCount;
-  const viewerName = viewer?.global_name || viewer?.globalName || viewer?.username || null;
-  const viewerAvatar = discordAvatarUrl(viewer);
-  const accountCard = viewer
-    ? `
-      <div class="account">
-        <small>Linked Discord</small>
-        <strong>${escapeHtml(viewerName || `User ${viewer.id}`)}</strong>
-        <div class="account-user">
-          <span class="avatar"${viewerAvatar ? ` style="background-image:url('${escapeHtml(viewerAvatar)}')"` : ""}></span>
-          <div>
-            <small>Signed in</small>
-            <strong>@${escapeHtml(viewer.username || viewerName || viewer.id)}</strong>
-          </div>
-        </div>
-        <div class="account-actions">
-          <a class="control" href="/recordings/mine/">My Sessions</a>
-          <a class="control" href="/auth/logout?next=${encodeURIComponent(currentPath)}">Logout</a>
-        </div>
-      </div>
-    `
-    : `
-      <div class="account">
-        <small>Library</small>
-        <strong>recording.olavehome.uk</strong>
-        ${
-          hasDiscordWebAuth()
-            ? `<div class="account-actions"><a class="action" href="/auth/discord/login?next=${encodeURIComponent(currentPath)}">Link Discord</a></div>`
-            : `<p class="meta">Discord linking is available once OAuth is configured.</p>`
-        }
-      </div>
-    `;
+  return { total, recent, archived, active, mine };
+}
 
-  const rowsMarkup = rows.length > 0 ? { rows: rows.join(""), sessionCount: rows.length } : null;
-  return renderLibraryPage({
-    currentPath,
-    accountCard,
-    heroText: onlyParticipantId
-      ? `Showing sessions that include your voice capture${viewerName ? `, ${escapeHtml(viewerName)}` : ""}.`
-      : showMinePrompt
-        ? "Sign in with Discord to see only the sessions that include your own voice recordings."
-      : "Browse recent recordings and choose the session or files you want to download.",
-    toolbarLabel: onlyParticipantId || showMinePrompt ? "Showing your matched sessions" : "Showing recent sessions",
-    sessionCountLabel: onlyParticipantId || showMinePrompt ? "Matched sessions" : "Total sessions",
-    readyCount,
-    liveCount,
-    rowsMarkup,
-    emptyMarkup: hasDiscordWebAuth() && (onlyParticipantId || showMinePrompt) && !viewer
-      ? `<section class="empty">Sign in with Discord to view sessions that include your audio. <a class="action" href="/auth/discord/login?next=${encodeURIComponent(currentPath)}">Link Discord</a></section>`
-      : `<section class="empty">${onlyParticipantId ? "No sessions matching your Discord account were found yet." : "No recording sessions are available right now."}</section>`,
-  });
+function buildRecordingRowView(summary, viewer = null) {
+  const { session, audioStats, totalSize, status, title, subtitle, participantIds, archived } = summary;
+  return {
+    icon: session.completedAt ? "🗂" : "●",
+    title,
+    subtitle: `${subtitle} • ${formatBytes(totalSize)}`,
+    details: `Started ${formatDateTime(session.startedAt)}${session.completedAt ? ` • Completed ${formatDateTime(session.completedAt)}` : ""}`,
+    status,
+    archived,
+    includesViewer: Boolean(viewer?.id && participantIds.includes(viewer.id)),
+    sideText: `Expires ${formatDateTime(session.expiresAt())}`,
+    openHref: `/recordings/${encodeURIComponent(session.token)}/`,
+    zipHref: session.archivePath ? `/recordings/${encodeURIComponent(session.token)}/session.zip` : null,
+    fileChips: audioStats.slice(0, 4).map((file) => ({
+      href: `/recordings/${encodeURIComponent(session.token)}/${encodeURIComponent(file.name)}`,
+      label: file.name,
+      sizeLabel: formatBytes(file.size),
+    })),
+    sortKey: String(getSessionReferenceTime(session).getTime()),
+    searchLabel: `${title} ${subtitle} ${audioStats.map((file) => file.name).join(" ")}`.toLowerCase(),
+  };
 }
 
 async function createZipArchive(directory, destination, wavFiles) {
@@ -1150,6 +956,68 @@ async function createZipArchive(directory, destination, wavFiles) {
 
     archive.finalize().catch(reject);
   });
+}
+
+async function runFfmpeg(args) {
+  return await new Promise((resolve, reject) => {
+    execFile("ffmpeg", args, { windowsHide: true, encoding: "utf8" }, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function archiveRecordingSessionIfNeeded(session, now = Date.now()) {
+  if (!session.completedAt || session.isExpired(now) || isRecentRecordingSession(session, now)) {
+    return;
+  }
+
+  const wavFiles = await session.wavFiles();
+  if (wavFiles.length === 0) {
+    return;
+  }
+
+  logger.info(`Archiving recording session ${session.token} with ${wavFiles.length} WAV file(s).`);
+  const archivedFiles = [];
+  try {
+    for (const wavFile of wavFiles) {
+      const inputPath = path.join(session.directory, wavFile);
+      const outputName = `${path.basename(wavFile, path.extname(wavFile))}${ARCHIVE_AUDIO_EXTENSION}`;
+      const outputPath = path.join(session.directory, outputName);
+      await runFfmpeg([
+        "-y",
+        "-i",
+        inputPath,
+        "-vn",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        ARCHIVE_AUDIO_BITRATE,
+        "-vbr",
+        "on",
+        outputPath,
+      ]);
+      archivedFiles.push(outputName);
+    }
+
+    const nextArchivePath = path.join(session.directory, "session.zip");
+    await fsp.rm(nextArchivePath, { force: true }).catch(() => {});
+    await createZipArchive(session.directory, nextArchivePath, archivedFiles);
+
+    for (const wavFile of wavFiles) {
+      await fsp.rm(path.join(session.directory, wavFile), { force: true }).catch(() => {});
+    }
+
+    session.archivePath = nextArchivePath;
+    await session.writeMetadata();
+  } catch (error) {
+    logger.warn(`Failed to archive recording session ${session.token}: ${error.stderr?.trim() || error.message}`);
+  }
 }
 
 class GuildState {
@@ -2479,6 +2347,7 @@ async function pruneExpiredRecordings() {
   const sessions = await listRecordingSessions();
   for (const session of sessions) {
     if (!session.isExpired(now)) {
+      await archiveRecordingSessionIfNeeded(session, now);
       continue;
     }
 
@@ -2546,6 +2415,51 @@ async function fetchDiscordIdentity(accessToken) {
 async function startDownloadServer() {
   const app = express();
   app.disable("x-powered-by");
+
+  const renderHome = async (req) => {
+    const viewer = getAuthenticatedRecordingUser(req);
+    const viewerModel = buildViewerModel(viewer);
+    const summaries = await loadRecordingSummaries();
+    const stats = buildRecordingStats(summaries, viewer?.id || null);
+    return renderRecordingsHomePage({
+      viewer: viewerModel,
+      oauthConfigured: hasDiscordWebAuth(),
+      retentionDays: RECORDINGS_TTL_DAYS,
+      storageRoot: RECORDINGS_DIR,
+      recentWindowDays: RECENT_RECORDINGS_DAYS,
+      stats: [
+        { id: "sessionCount", label: "Total sessions", value: String(stats.total) },
+        { label: `Recent (${RECENT_RECORDINGS_DAYS}d)`, value: String(stats.recent) },
+        { label: "Archives", value: String(stats.archived) },
+        { label: viewerModel ? "My sessions" : "Active captures", value: String(viewerModel ? stats.mine : stats.active) },
+      ],
+    });
+  };
+
+  const renderListPage = async (req, { currentPath, heroText, toolbarLabel, sessionCountLabel, filter, emptyText }) => {
+    const viewer = getAuthenticatedRecordingUser(req);
+    const viewerModel = buildViewerModel(viewer);
+    const summaries = (await loadRecordingSummaries()).filter(filter);
+    const stats = buildRecordingStats(summaries, viewer?.id || null);
+    return renderRecordingsListPage({
+      viewer: viewerModel,
+      oauthConfigured: hasDiscordWebAuth(),
+      currentPath,
+      retentionDays: RECORDINGS_TTL_DAYS,
+      storageRoot: RECORDINGS_DIR,
+      heroText,
+      toolbarLabel,
+      sessionCountLabel,
+      stats: [
+        { id: "sessionCount", label: sessionCountLabel, value: String(summaries.length) },
+        { label: "Ready downloads", value: String(summaries.filter((summary) => Boolean(summary.session.completedAt)).length) },
+        { label: "Active captures", value: String(summaries.filter((summary) => !summary.session.completedAt).length) },
+        { label: "Compressed", value: String(summaries.filter((summary) => summary.archived).length) },
+      ],
+      rows: summaries.map((summary) => buildRecordingRowView(summary, viewer)),
+      emptyText,
+    });
+  };
 
   app.get("/auth/discord/login", async (req, res) => {
     if (!hasDiscordWebAuth()) {
@@ -2615,12 +2529,54 @@ async function startDownloadServer() {
 
   app.get("/", async (req, res) => {
     await pruneExpiredRecordings();
-    res.type("html").send(await renderRecordingIndexPage({ viewer: getAuthenticatedRecordingUser(req) }));
+    res.type("html").send(await renderHome(req));
   });
 
   app.get(["/recordings", "/recordings/"], async (req, res) => {
     await pruneExpiredRecordings();
-    res.type("html").send(await renderRecordingIndexPage({ viewer: getAuthenticatedRecordingUser(req) }));
+    res.type("html").send(await renderHome(req));
+  });
+
+  app.get(["/recordings/recent", "/recordings/recent/"], async (req, res) => {
+    await pruneExpiredRecordings();
+    res.type("html").send(
+      await renderListPage(req, {
+        currentPath: "/recordings/recent/",
+        heroText: `Recent Sessions contains recordings captured in the last ${RECENT_RECORDINGS_DAYS} days.`,
+        toolbarLabel: "Showing recent sessions",
+        sessionCountLabel: "Recent sessions",
+        filter: (summary) => isRecentRecordingSession(summary.session),
+        emptyText: "No recent recording sessions are available right now.",
+      }),
+    );
+  });
+
+  app.get(["/recordings/archives", "/recordings/archives/"], async (req, res) => {
+    await pruneExpiredRecordings();
+    res.type("html").send(
+      await renderListPage(req, {
+        currentPath: "/recordings/archives/",
+        heroText: `Archives contains recordings older than ${RECENT_RECORDINGS_DAYS} days. These are stored as smaller compressed files.`,
+        toolbarLabel: "Showing archived sessions",
+        sessionCountLabel: "Archived sessions",
+        filter: (summary) => isArchivedRecordingSummary(summary),
+        emptyText: "No archived sessions are available yet.",
+      }),
+    );
+  });
+
+  app.get(["/recordings/help", "/recordings/help/"], async (req, res) => {
+    await pruneExpiredRecordings();
+    res.type("html").send(
+      renderRecordingsHelpPage({
+        viewer: buildViewerModel(getAuthenticatedRecordingUser(req)),
+        oauthConfigured: hasDiscordWebAuth(),
+        currentPath: "/recordings/help/",
+        retentionDays: RECORDINGS_TTL_DAYS,
+        storageRoot: RECORDINGS_DIR,
+        recentWindowDays: RECENT_RECORDINGS_DAYS,
+      }),
+    );
   });
 
   app.get(["/recordings/mine", "/recordings/mine/"], async (req, res) => {
@@ -2636,20 +2592,26 @@ async function startDownloadServer() {
     const viewer = getAuthenticatedRecordingUser(req);
     if (!viewer?.id) {
       res.type("html").send(
-        await renderRecordingIndexPage({
-          viewer: null,
+        await renderListPage(req, {
           currentPath: "/recordings/mine/",
-          showMinePrompt: true,
+          heroText: "Sign in with Discord to see only the recordings that include your own voice.",
+          toolbarLabel: "Showing your matched sessions",
+          sessionCountLabel: "Matched sessions",
+          filter: () => false,
+          emptyText: 'Sign in with Discord to view sessions that include your audio. Use the "Link Discord" button in the sidebar.',
         }),
       );
       return;
     }
 
     res.type("html").send(
-      await renderRecordingIndexPage({
-        viewer,
-        onlyParticipantId: viewer.id,
+      await renderListPage(req, {
         currentPath: "/recordings/mine/",
+        heroText: `Showing all recordings that include your voice capture, ${viewer.global_name || viewer.globalName || viewer.username}.`,
+        toolbarLabel: "Showing your matched sessions",
+        sessionCountLabel: "Matched sessions",
+        filter: (summary) => summary.participantIds.includes(viewer.id),
+        emptyText: "No recordings matching your Discord account were found yet.",
       }),
     );
   });
@@ -2666,12 +2628,33 @@ async function startDownloadServer() {
       return;
     }
 
-    const wavFiles = await session.wavFiles();
-    const links = wavFiles
-      .map((name) => `<li><a href="${encodeURIComponent(name)}">${escapeHtml(name)}</a></li>`)
-      .join("");
-    const zipLink = session.archivePath ? `<p><a href="session.zip">Download ZIP</a></p>` : "";
-    res.type("html").send(`<html><body><h1>Recording files</h1>${zipLink}<ul>${links}</ul><p><a href="/recordings/">Back to library</a></p></body></html>`);
+    const audioFiles = await session.audioFiles();
+    const fileStats = await Promise.all(
+      audioFiles.map(async (name) => {
+        const stat = await fsp.stat(path.join(session.directory, name)).catch(() => null);
+        return {
+          name,
+          sizeLabel: formatBytes(stat?.size || 0),
+          href: `/recordings/${encodeURIComponent(token)}/${encodeURIComponent(name)}`,
+          archived: path.extname(name).toLowerCase() !== ".wav",
+        };
+      }),
+    );
+    res.type("html").send(
+      renderRecordingSessionPage({
+        viewer: buildViewerModel(getAuthenticatedRecordingUser(req)),
+        oauthConfigured: hasDiscordWebAuth(),
+        currentPath: "/recordings/mine/",
+        retentionDays: RECORDINGS_TTL_DAYS,
+        storageRoot: RECORDINGS_DIR,
+        title: session.guildName || `Guild ${session.guildId}`,
+        subtitle: session.channelName ? `Channel ${session.channelName}` : `Session ${session.token.slice(0, 8)}`,
+        details: `Started ${formatDateTime(session.startedAt)}${session.completedAt ? ` • Completed ${formatDateTime(session.completedAt)}` : ""} • Expires ${formatDateTime(session.expiresAt())}`,
+        zipHref: session.archivePath ? `/recordings/${encodeURIComponent(token)}/session.zip` : null,
+        files: fileStats,
+        archived: audioFiles.length > 0 && audioFiles.every((name) => path.extname(name).toLowerCase() !== ".wav"),
+      }),
+    );
   });
 
   app.get("/recordings/:token/session.zip", async (req, res) => {

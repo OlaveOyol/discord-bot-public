@@ -50,6 +50,8 @@ This bot can:
 - `DOWNLOAD_PORT_SEARCH_ATTEMPTS` - number of ports to try starting from `DOWNLOAD_PORT`, default `20`
 - `RECORDINGS_DIR` - recording output directory, default temp path
 - `RECORDINGS_TTL_DAYS` - recording retention window in days, default `30`, capped at `31`
+- `RECENT_RECORDINGS_DAYS` - recent/archive split window in days, default `7`
+- `ARCHIVE_AUDIO_BITRATE` - ffmpeg bitrate used when older recordings are compressed for archives, default `48k`
 - `CLEANUP_INTERVAL_SECONDS` - expired-recording cleanup interval, default `3600`
 - `AFK_DISCONNECT_SECONDS` - idle timeout before leaving voice, default `300`
 - `SPOTIFY_CLIENT_ID` - recommended for Spotify track, playlist, and album expansion
@@ -95,6 +97,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 - each speaker is written to a separate WAV file
 - `/recordstop` returns individual file links and a ZIP archive when audio was captured
 - completed recordings expire after 30 days by default
+- recordings older than 7 days move into `Archives` and are recompressed into smaller audio files
 - set `DOWNLOAD_BASE_URL=https://recording.olavehome.uk` when you put the bot behind your reverse proxy
 - if Discord OAuth is configured, the recordings website can show a `My Sessions` view filtered to sessions that include the signed-in Discord user
 - if Discord OAuth is configured, individual session pages, WAV files, and ZIP downloads are restricted to Discord users who were included in that session
@@ -107,6 +110,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 - Commands are synced per guild on startup so they appear quickly in servers the bot is already in.
 - Discord voice receive is still not officially documented by Discord, but the Node voice stack here is the chosen path over the previous Python receive extension.
 - The website login uses Discord OAuth `identify` scope only. Session matching works by the Discord user IDs already embedded in per-user WAV filenames.
+- The recordings web UI now lives in a separate renderer module, `recordings-web.js`, instead of being embedded directly inside the bot routes.
 
 ## Proxmox / LXC
 
@@ -135,7 +139,7 @@ Storage sizing for recordings:
 - the bot currently writes `48 kHz`, `16-bit`, stereo WAV per speaker
 - that is about `659 MiB/hour/user`
 - a `6` hour session is about `3.9 GiB` per actively speaking user
-- `120 GB` is enough for long sessions, but your `7` day retention window means frequent large recordings will accumulate quickly
+- `120 GB` is enough for long sessions, but your `30` day retention window means frequent large recordings will accumulate quickly
 
 ### Automated Proxmox Create
 
