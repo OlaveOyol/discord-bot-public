@@ -7,10 +7,10 @@ Wants=network-online.target
 Type=simple
 User=discordbot
 Group=discordbot
-WorkingDirectory=/opt/discord-bot
+WorkingDirectory=/opt/discord-bot/current
 Environment=NODE_ENV=production
-EnvironmentFile=-/opt/discord-bot/.env
-ExecStart=/usr/bin/node /opt/discord-bot/bot.js
+EnvironmentFile=-/opt/discord-bot/shared/.env
+ExecStart=/usr/bin/node /opt/discord-bot/current/bot.js
 Restart=on-failure
 RestartSec=5
 

@@ -10,7 +10,9 @@
   },
   "scripts": {
     "start": "node bot.js",
-    "check": "node --check bot.js"
+    "check": "node --check bot.js",
+    "package:release": "node deploy/scripts/package-release.js",
+    "ota:apply": "node deploy/scripts/ota-supervisor.js apply"
   },
   "dependencies": {
     "@discordjs/voice": "^0.19.2",

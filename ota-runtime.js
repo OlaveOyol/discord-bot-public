@@ -111,7 +111,7 @@ function createOtaRuntime({
   }
 
   function matchesCurrentRuntimeVersion(pendingUpdate) {
-    return pendingUpdate?.version === runtimeVersion.version;
+    return pendingUpdate?.version === runtimeVersion.releaseId || pendingUpdate?.version === runtimeVersion.version;
   }
 
   function buildSupervisorSnapshot(now = Date.now()) {
@@ -122,6 +122,7 @@ function createOtaRuntime({
       contractVersion: supervisorContractVersion,
       runtimeVersion: formatRuntimeVersion(),
       currentVersion: runtimeVersion.version,
+      currentReleaseId: runtimeVersion.releaseId,
       health,
       update: {
         pending: updateCoordinator.pendingUpdate,

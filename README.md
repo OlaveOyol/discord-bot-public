@@ -60,6 +60,7 @@ This bot can:
 - `SPOTIFY_CLIENT_ID` - recommended for Spotify track, playlist, and album expansion
 - `SPOTIFY_CLIENT_SECRET` - recommended for Spotify track, playlist, and album expansion
 - `PLAYLIST_MAX_TRACKS` - max tracks imported from one playlist or album, default `200`
+- `SUPERVISOR_TOKEN` - optional bearer token required by the local-only `/internal/ota/*` supervisor endpoints
 
 ## Commands
 
@@ -207,10 +208,12 @@ sudo APP_DIR=/opt/discord-bot SERVICE_NAME=discord-bot BRANCH=main ./scripts/dep
 The deploy script:
 
 - updates the checkout to the target branch
-- runs `npm ci --omit=dev`
+- runs `npm ci --omit=dev` in the repo checkout
 - runs `npm run check`
-- installs or refreshes the `systemd` unit
-- restarts the bot service
+- packages a release artifact from the checked-out repo
+- stages and applies that artifact through the local OTA supervisor flow
+- installs or refreshes the `systemd` unit that points at `/opt/discord-bot/current`
+- rolls back to the previous release if restart or health verification fails
 
 ### GitHub Actions Deploy
 
@@ -256,6 +259,8 @@ If you want direct editing from your IDE as well, point VS Code Remote SSH at th
 ### Service Management
 
 The systemd unit lives at [discord-bot.service](./deploy/systemd/discord-bot.service).
+
+The release-layout and supervisor notes live in [deploy/ota/README.md](./deploy/ota/README.md).
 
 Common commands on the container:
 

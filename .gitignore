@@ -3,6 +3,7 @@ recordings/
 __pycache__/
 .venv/
 .cache
+dist/
 node_modules/
 .bot.lock
 *.log
