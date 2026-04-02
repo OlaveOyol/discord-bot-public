@@ -123,6 +123,12 @@ const RECORDING_RESUBSCRIBE_DELAY_MS = Math.max(
   100,
   Number.parseInt(env("RECORDING_RESUBSCRIBE_DELAY_MS", "350"), 10),
 );
+const PCM_SAMPLE_RATE = 48000;
+const PCM_CHANNELS = 2;
+const PCM_BITS_PER_SAMPLE = 16;
+const PCM_BYTES_PER_SAMPLE = PCM_BITS_PER_SAMPLE / 8;
+const PCM_BLOCK_ALIGN = PCM_CHANNELS * PCM_BYTES_PER_SAMPLE;
+const PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_BLOCK_ALIGN;
 
 let spotifyTokenCache = null;
 let downloadBaseUrl = DOWNLOAD_BASE_URL;
@@ -545,6 +551,33 @@ class WaveFileWriter {
     this.stream.write(buffer);
   }
 
+  writeSilence(byteCount) {
+    if (this.closed || !Number.isFinite(byteCount) || byteCount <= 0) {
+      return;
+    }
+
+    const remainingTarget = Math.floor(byteCount / PCM_BLOCK_ALIGN) * PCM_BLOCK_ALIGN;
+    if (remainingTarget <= 0) {
+      return;
+    }
+
+    const silenceChunk = Buffer.alloc(Math.min(PCM_BYTES_PER_SECOND, remainingTarget));
+    let remaining = remainingTarget;
+    while (remaining > 0) {
+      const chunk = remaining >= silenceChunk.length ? silenceChunk : Buffer.alloc(remaining);
+      this.write(chunk);
+      remaining -= chunk.length;
+    }
+  }
+
+  padToBytePosition(targetBytes) {
+    const alignedTarget = Math.floor(Math.max(0, targetBytes) / PCM_BLOCK_ALIGN) * PCM_BLOCK_ALIGN;
+    if (alignedTarget <= this.dataBytes) {
+      return;
+    }
+    this.writeSilence(alignedTarget - this.dataBytes);
+  }
+
   async close() {
     if (this.closed) {
       return;
@@ -571,11 +604,11 @@ function buildWavHeader(dataBytes) {
   header.write("fmt ", 12);
   header.writeUInt32LE(16, 16);
   header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(2, 22);
-  header.writeUInt32LE(48000, 24);
-  header.writeUInt32LE(48000 * 2 * 2, 28);
-  header.writeUInt16LE(2 * 2, 32);
-  header.writeUInt16LE(16, 34);
+  header.writeUInt16LE(PCM_CHANNELS, 22);
+  header.writeUInt32LE(PCM_SAMPLE_RATE, 24);
+  header.writeUInt32LE(PCM_BYTES_PER_SECOND, 28);
+  header.writeUInt16LE(PCM_BLOCK_ALIGN, 32);
+  header.writeUInt16LE(PCM_BITS_PER_SAMPLE, 34);
   header.write("data", 36);
   header.writeUInt32LE(dataBytes, 40);
   return header;
@@ -596,6 +629,7 @@ class RecordingSession {
     this.receiver = null;
     this.connection = null;
     this.speakingListener = null;
+    this.startedHrTime = process.hrtime.bigint();
     this.userStreams = new Map();
     this.fileWriters = new Map();
     this.resubscribeTimers = new Map();
@@ -641,6 +675,12 @@ class RecordingSession {
     writer = new WaveFileWriter(path.join(this.directory, fileName));
     this.fileWriters.set(userId, writer);
     return writer;
+  }
+
+  timelineBytePosition(reference = process.hrtime.bigint()) {
+    const elapsedNs = Number(reference - this.startedHrTime);
+    const samples = Math.max(0, Math.round((elapsedNs * PCM_SAMPLE_RATE) / 1_000_000_000));
+    return samples * PCM_BLOCK_ALIGN;
   }
 
   async subscribeUser(guild, userId) {
@@ -698,7 +738,16 @@ class RecordingSession {
       logger.warn(`Recording decoder error for user ${userId} in guild ${guild.id}: ${error.message}`);
       destroyEntry({ resubscribe: true });
     });
-    decoder.on("data", (chunk) => writer.write(chunk));
+    decoder.on("data", (chunk) => {
+      const chunkLength = Math.floor(chunk.length / PCM_BLOCK_ALIGN) * PCM_BLOCK_ALIGN;
+      if (chunkLength <= 0) {
+        return;
+      }
+      const targetEnd = this.timelineBytePosition();
+      const targetStart = Math.max(writer.dataBytes, targetEnd - chunkLength);
+      writer.padToBytePosition(targetStart);
+      writer.write(chunkLength === chunk.length ? chunk : chunk.subarray(0, chunkLength));
+    });
     opusStream.once("end", () => destroyEntry());
     opusStream.once("close", () => destroyEntry());
     opusStream.pipe(decoder);
@@ -722,7 +771,9 @@ class RecordingSession {
     }
     this.resubscribeTimers.clear();
 
+    const sessionEndBytes = this.timelineBytePosition();
     for (const writer of this.fileWriters.values()) {
+      writer.padToBytePosition(sessionEndBytes);
       await writer.close();
     }
 
@@ -814,6 +865,7 @@ async function restoreRecordingSessionFromDirectory(directoryPath) {
   session.receiver = null;
   session.connection = null;
   session.speakingListener = null;
+  session.startedHrTime = process.hrtime.bigint();
   session.userStreams = new Map();
   session.fileWriters = new Map();
   session.resubscribeTimers = new Map();

@@ -97,6 +97,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 
 - recording captures incoming user voice only
 - each speaker is written to a separate WAV file
+- per-user stems now preserve silence so their timing lines up naturally against the same session clock
 - `/recordstop` returns individual file links and a ZIP archive when audio was captured
 - completed recordings expire after 30 days by default
 - recordings older than 7 days move into `Archives` and are recompressed into smaller audio files
