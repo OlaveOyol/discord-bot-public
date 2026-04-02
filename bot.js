@@ -401,7 +401,7 @@ function serializeCookie(name, value, options = {}) {
   if (options.sameSite) {
     parts.push(`SameSite=${options.sameSite}`);
   } else {
-    parts.push("SameSite=Lax");
+    parts.push(isSecureCookieRequest() ? "SameSite=None" : "SameSite=Lax");
   }
   if (options.secure ?? isSecureCookieRequest()) {
     parts.push("Secure");
@@ -971,7 +971,12 @@ function renderLibraryPage({
 </html>`;
 }
 
-async function renderRecordingIndexPage({ viewer = null, onlyParticipantId = null, currentPath = "/recordings/" } = {}) {
+async function renderRecordingIndexPage({
+  viewer = null,
+  onlyParticipantId = null,
+  currentPath = "/recordings/",
+  showMinePrompt = false,
+} = {}) {
   const summaries = (await Promise.all((await listRecordingSessions()).map((session) => summarizeRecordingSession(session))))
     .filter((summary) => !onlyParticipantId || summary.participantIds.includes(onlyParticipantId));
 
@@ -1053,13 +1058,15 @@ async function renderRecordingIndexPage({ viewer = null, onlyParticipantId = nul
     accountCard,
     heroText: onlyParticipantId
       ? `Showing sessions that include your voice capture${viewerName ? `, ${escapeHtml(viewerName)}` : ""}.`
+      : showMinePrompt
+        ? "Sign in with Discord to see only the sessions that include your own voice recordings."
       : "Browse recent recordings and choose the session or files you want to download.",
-    toolbarLabel: onlyParticipantId ? "Showing your matched sessions" : "Showing recent sessions",
-    sessionCountLabel: onlyParticipantId ? "Matched sessions" : "Total sessions",
+    toolbarLabel: onlyParticipantId || showMinePrompt ? "Showing your matched sessions" : "Showing recent sessions",
+    sessionCountLabel: onlyParticipantId || showMinePrompt ? "Matched sessions" : "Total sessions",
     readyCount,
     liveCount,
     rowsMarkup,
-    emptyMarkup: hasDiscordWebAuth() && onlyParticipantId && !viewer
+    emptyMarkup: hasDiscordWebAuth() && (onlyParticipantId || showMinePrompt) && !viewer
       ? `<section class="empty">Sign in with Discord to view sessions that include your audio. <a class="action" href="/auth/discord/login?next=${encodeURIComponent(currentPath)}">Link Discord</a></section>`
       : `<section class="empty">${onlyParticipantId ? "No sessions matching your Discord account were found yet." : "No recording sessions are available right now."}</section>`,
   });
@@ -2576,7 +2583,13 @@ async function startDownloadServer() {
 
     const viewer = getAuthenticatedRecordingUser(req);
     if (!viewer?.id) {
-      res.redirect(`/auth/discord/login?next=${encodeURIComponent("/recordings/mine/")}`);
+      res.type("html").send(
+        await renderRecordingIndexPage({
+          viewer: null,
+          currentPath: "/recordings/mine/",
+          showMinePrompt: true,
+        }),
+      );
       return;
     }
 
