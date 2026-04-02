@@ -74,6 +74,7 @@ const DOWNLOAD_PORT_SEARCH_ATTEMPTS = Math.max(
 const RECORDINGS_DIR = env("RECORDINGS_DIR", path.join(os.tmpdir(), "discord-bot-recordings"));
 const PLAYBACK_STATE_PATH = env("PLAYBACK_STATE_PATH", path.join(RECORDINGS_DIR, "_playback-state.json"));
 const RECORDING_NICKNAME_INDICATOR = " 🔴";
+const RESUME_EARLY_END_THRESHOLD_MS = 5_000;
 const RECORDINGS_TTL_DAYS = Math.min(31, Math.max(1, Number.parseInt(env("RECORDINGS_TTL_DAYS", "30"), 10)));
 const RECENT_RECORDINGS_DAYS = Math.min(
   RECORDINGS_TTL_DAYS,
@@ -1521,6 +1522,31 @@ class GuildState {
 
   async onTrackFinished() {
     if (this.current) {
+      const resumeOffsetMs = Number.isFinite(this.current.resumeOffsetMs) ? Math.max(0, this.current.resumeOffsetMs) : 0;
+      const playbackOffsetMs = this.currentOffsetMs;
+      const resumedForMs = Math.max(0, playbackOffsetMs - resumeOffsetMs);
+      const durationMs = Number.isFinite(this.current.duration) ? this.current.duration * 1000 : null;
+      const remainingMs = durationMs === null ? null : Math.max(0, durationMs - playbackOffsetMs);
+      if (
+        resumeOffsetMs > 0 &&
+        !this.current.resumeFallbackTried &&
+        resumedForMs > 0 &&
+        resumedForMs < RESUME_EARLY_END_THRESHOLD_MS &&
+        (remainingMs === null || remainingMs > RESUME_EARLY_END_THRESHOLD_MS)
+      ) {
+        logger.warn(
+          `Resumed playback for '${this.current.title}' in guild ${this.guildId} ended after ${Math.floor(resumedForMs / 1000)}s; retrying from the start.`,
+        );
+        this.current.resumeOffsetMs = 0;
+        this.current.resumeFallbackTried = true;
+        this.queue.unshift(this.current);
+        this.current = null;
+        this.currentOffsetMs = 0;
+        this.playbackStartedAtMs = null;
+        await this.playNext();
+        return;
+      }
+
       this.current.resumeOffsetMs = 0;
       this.history.unshift(this.current);
       this.history = this.history.slice(0, 20);
