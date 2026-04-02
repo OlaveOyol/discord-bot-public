@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { finished } = require("node:stream/promises");
-const { spawn } = require("node:child_process");
+const { execFile, spawn } = require("node:child_process");
 
 const archiver = require("archiver");
 const dotenv = require("dotenv");
@@ -1303,30 +1303,71 @@ function resolveYtDlpPath() {
   return "yt-dlp";
 }
 
-async function createYouTubeResource(track, url) {
+async function runYtDlp(args) {
   const ytDlpPath = resolveYtDlpPath();
-  const ytDlp = spawn(
-    ytDlpPath,
-    [
-      "--no-playlist",
-      "--force-ipv4",
-      "--no-progress",
-      "--js-runtimes",
-      "node",
-      "-f",
-      "bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio",
-      "-o",
-      "-",
-      url,
-    ],
-    {
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
+  return await new Promise((resolve, reject) => {
+    execFile(ytDlpPath, args, { windowsHide: true, encoding: "utf8" }, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function resolveYouTubeMediaUrl(track, url) {
+  const formatSelector = "bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio";
+  const baseArgs = ["--no-playlist", "--force-ipv4", "--no-progress", "-f", formatSelector, "-g", url];
+  const attempts = [
+    ["--js-runtimes", "node", ...baseArgs],
+    baseArgs,
+  ];
+
+  let lastError = null;
+  for (const args of attempts) {
+    try {
+      const { stdout, stderr } = await runYtDlp(args);
+      const lines = String(stdout || "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      if (stderr?.trim()) {
+        logger.warn(`yt-dlp resolver for '${track.title}': ${stderr.trim()}`);
+      }
+      const mediaUrl = lines[0];
+      if (!mediaUrl || !isHttpUrl(mediaUrl)) {
+        throw new Error("yt-dlp did not return a playable media URL");
+      }
+      return mediaUrl;
+    } catch (error) {
+      lastError = error;
+      const stderr = String(error?.stderr || "").trim();
+      if (stderr && !stderr.includes("no such option: --js-runtimes")) {
+        logger.warn(`yt-dlp resolver failed for '${track.title}': ${stderr}`);
+      }
+      if (!stderr.includes("no such option: --js-runtimes")) {
+        break;
+      }
+    }
+  }
+
+  throw new Error(lastError?.stderr?.trim() || lastError?.message || "yt-dlp failed to resolve a media URL");
+}
+
+async function createYouTubeResource(track, url) {
+  const mediaUrl = await resolveYouTubeMediaUrl(track, url);
   const ffmpeg = spawn(
     env("FFMPEG_PATH", "ffmpeg"),
     [
+      "-reconnect",
+      "1",
+      "-reconnect_streamed",
+      "1",
+      "-reconnect_delay_max",
+      "5",
       "-probesize",
       "32M",
       "-analyzeduration",
@@ -1334,7 +1375,7 @@ async function createYouTubeResource(track, url) {
       "-loglevel",
       "error",
       "-i",
-      "pipe:0",
+      mediaUrl,
       "-vn",
       "-sn",
       "-dn",
@@ -1353,37 +1394,11 @@ async function createYouTubeResource(track, url) {
   );
 
   const cleanup = () => {
-    if (!ytDlp.killed) {
-      ytDlp.kill();
-    }
     if (!ffmpeg.killed) {
       ffmpeg.kill();
     }
   };
 
-  ytDlp.stdout.pipe(ffmpeg.stdin);
-  ytDlp.stderr.on("data", (chunk) => {
-    const text = String(chunk || "").trim();
-    if (text && !text.startsWith("[download]")) {
-      logger.warn(`yt-dlp playback helper for '${track.title}': ${text}`);
-    }
-  });
-  ytDlp.on("error", (error) => {
-    logger.warn(`yt-dlp playback helper failed for '${track.title}': ${error.message}`);
-    ffmpeg.stdin.destroy(error);
-  });
-  ytDlp.on("close", (code) => {
-    if (code && code !== 0) {
-      logger.warn(`yt-dlp exited with code ${code} for '${track.title}'`);
-    }
-    ffmpeg.stdin.end();
-  });
-
-  ffmpeg.stdin.on("error", (error) => {
-    if (error?.code !== "EPIPE") {
-      logger.warn(`FFmpeg playback pipe failed for '${track.title}': ${error.message}`);
-    }
-  });
   ffmpeg.stderr.on("data", (chunk) => {
     const text = String(chunk || "").trim();
     if (text) {
