@@ -1318,8 +1318,7 @@ class GuildState {
 
     this.player.on("stateChange", (oldState, newState) => {
       if (oldState.status === AudioPlayerStatus.Playing && newState.status !== AudioPlayerStatus.Playing) {
-        this.currentOffsetMs = this.currentPlaybackOffsetMs();
-        this.playbackStartedAtMs = null;
+        this.capturePlaybackOffset();
       } else if (oldState.status !== AudioPlayerStatus.Playing && newState.status === AudioPlayerStatus.Playing && this.current) {
         this.playbackStartedAtMs = Date.now();
       }
@@ -1365,6 +1364,28 @@ class GuildState {
       offset = Math.min(offset, Math.max(0, durationMs));
     }
     return Math.max(0, Math.floor(offset));
+  }
+
+  capturePlaybackOffset() {
+    if (!this.current) {
+      this.currentOffsetMs = 0;
+      this.playbackStartedAtMs = null;
+      return 0;
+    }
+
+    let offset = this.currentOffsetMs;
+    if (this.playbackStartedAtMs) {
+      offset += Math.max(0, Date.now() - this.playbackStartedAtMs);
+    }
+
+    const durationMs = Number.isFinite(this.current.duration) ? this.current.duration * 1000 : null;
+    if (durationMs !== null) {
+      offset = Math.min(offset, Math.max(0, durationMs));
+    }
+
+    this.currentOffsetMs = Math.max(0, Math.floor(offset));
+    this.playbackStartedAtMs = null;
+    return this.currentOffsetMs;
   }
 
   async ensureConnectionToChannel(voiceChannel, { requireReceive = false } = {}) {
@@ -1560,8 +1581,7 @@ class GuildState {
   async pause() {
     const paused = this.player.pause(true);
     if (paused) {
-      this.currentOffsetMs = this.currentPlaybackOffsetMs();
-      this.playbackStartedAtMs = null;
+      this.capturePlaybackOffset();
       await this.refreshState();
     }
     return paused;
