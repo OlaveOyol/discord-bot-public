@@ -2556,22 +2556,12 @@ async function startDownloadServer() {
     res.type("html").send(await renderRecordingIndexPage({ viewer: getAuthenticatedRecordingUser(req) }));
   });
 
-  app.get("/recordings", async (_, res) => {
-    await pruneExpiredRecordings();
-    res.redirect("/recordings/");
-  });
-
-  app.get("/recordings/", async (req, res) => {
+  app.get(["/recordings", "/recordings/"], async (req, res) => {
     await pruneExpiredRecordings();
     res.type("html").send(await renderRecordingIndexPage({ viewer: getAuthenticatedRecordingUser(req) }));
   });
 
-  app.get("/recordings/mine", async (_, res) => {
-    await pruneExpiredRecordings();
-    res.redirect("/recordings/mine/");
-  });
-
-  app.get("/recordings/mine/", async (req, res) => {
+  app.get(["/recordings/mine", "/recordings/mine/"], async (req, res) => {
     await pruneExpiredRecordings();
     if (!hasDiscordWebAuth()) {
       res
