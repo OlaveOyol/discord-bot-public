@@ -28,6 +28,16 @@ require_command npm
 require_command node
 require_command systemctl
 
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v yt-dlp >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y ffmpeg yt-dlp
+  else
+    echo "Missing ffmpeg and/or yt-dlp and no apt-get is available to install them." >&2
+    exit 1
+  fi
+fi
+
 if ! id "$APP_USER" >/dev/null 2>&1; then
   useradd --system --user-group --create-home --home-dir "/home/$APP_USER" --shell /usr/sbin/nologin "$APP_USER"
 fi

@@ -24,7 +24,7 @@ This bot can:
    ```
 
 3. Copy `.env.example` to `.env` and fill in your values.
-4. Install `ffmpeg` on the host or in the container. Playback works best with it available.
+4. Install `ffmpeg` and `yt-dlp` on the host or in the container. YouTube playback depends on both.
 5. Start the bot:
 
    ```bash
