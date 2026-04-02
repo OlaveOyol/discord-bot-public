@@ -3522,6 +3522,7 @@ async function handlePlay(interaction, { next = false } = {}) {
     throw new Error("This command must be used in a guild.");
   }
   otaRuntime.assertLongLivedActionAllowed(next ? "queue more playback" : "start playback");
+  await interaction.deferReply();
   const state = getGuildState(guild.id);
   const member = await requireSameVoiceContext(interaction, state, {
     actionDescription: next ? "queue tracks next" : "queue music",
@@ -3754,6 +3755,16 @@ async function handlePlayerButton(interaction, guildId, action) {
     otaRuntime.trackMeaningfulActivity(`player:${action}`);
   }
   await interaction.deferUpdate();
+
+  try {
+    await requireSameVoiceContext(interaction, state, { actionDescription: "use player controls" });
+  } catch (error) {
+    await interaction.followUp({
+      content: error && error.message ? error.message : "You must be in the same voice channel to use player controls.",
+      ephemeral: true,
+    });
+    return;
+  }
 
   switch (action) {
     case "pause_resume":
