@@ -28,6 +28,7 @@ const {
   EmbedBuilder,
   GatewayIntentBits,
   InteractionContextType,
+  PermissionFlagsBits,
   SlashCommandBuilder,
   escapeMarkdown,
 } = require("discord.js");
@@ -2605,7 +2606,14 @@ async function refreshRecordingNickname(guildId) {
   }
 
   const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
-  if (!me?.manageable) {
+  if (!me) {
+    return;
+  }
+
+  const canChangeOwnNickname = me.permissions.has(PermissionFlagsBits.ChangeNickname);
+  const canManageNicknames = me.manageable && me.permissions.has(PermissionFlagsBits.ManageNicknames);
+  if (!canChangeOwnNickname && !canManageNicknames) {
+    logger.warn(`Cannot update recording nickname in guild ${guildId}: missing ChangeNickname/ManageNicknames permission.`);
     return;
   }
 
@@ -2618,7 +2626,7 @@ async function refreshRecordingNickname(guildId) {
     if (currentNickname === targetNickname) {
       return;
     }
-    await me.setNickname(targetNickname, "Recording active").catch((error) => {
+    await guild.members.edit(client.user.id, { nick: targetNickname, reason: "Recording active" }).catch((error) => {
       logger.warn(`Failed to set recording nickname in guild ${guildId}: ${error.message}`);
     });
     return;
@@ -2637,7 +2645,7 @@ async function refreshRecordingNickname(guildId) {
     state.baseNickname = undefined;
     return;
   }
-  await me.setNickname(restoreNickname, "Recording inactive").catch((error) => {
+  await guild.members.edit(client.user.id, { nick: restoreNickname, reason: "Recording inactive" }).catch((error) => {
     logger.warn(`Failed to restore nickname in guild ${guildId}: ${error.message}`);
   });
   state.baseNickname = undefined;
