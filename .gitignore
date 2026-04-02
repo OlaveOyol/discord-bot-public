@@ -1,0 +1,8 @@
+.env
+recordings/
+__pycache__/
+.venv/
+.cache
+node_modules/
+.bot.lock
+*.log

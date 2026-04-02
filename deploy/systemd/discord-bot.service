@@ -1,0 +1,18 @@
+[Unit]
+Description=Discord Music and Recording Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=discordbot
+Group=discordbot
+WorkingDirectory=/opt/discord-bot
+Environment=NODE_ENV=production
+EnvironmentFile=-/opt/discord-bot/.env
+ExecStart=/usr/bin/node /opt/discord-bot/bot.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
