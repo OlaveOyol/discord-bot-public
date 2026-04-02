@@ -11,7 +11,7 @@ This bot can:
 - shuffle, skip, pause, resume, stop, and inspect queue/state
 - show a single playback panel with live buttons
 - record incoming user voice to per-user WAV files
-- serve recording downloads for 7 days, including a ZIP archive
+- serve recording downloads for up to 30 days, including a ZIP archive
 - leave voice automatically when idle for 5 minutes or when left alone
 
 ## Setup
@@ -40,12 +40,16 @@ This bot can:
 ## Environment Variables
 
 - `DISCORD_TOKEN` - required Discord bot token
+- `DISCORD_CLIENT_ID` - optional Discord OAuth client ID for website sign-in
+- `DISCORD_CLIENT_SECRET` - optional Discord OAuth client secret for website sign-in
+- `DISCORD_REDIRECT_URI` - optional Discord OAuth callback URL, for example `https://recording.olavehome.uk/auth/discord/callback`
+- `WEB_SESSION_SECRET` - optional signing secret for website login cookies
 - `DOWNLOAD_HOST` - bind host for the recording server, default `0.0.0.0`
 - `DOWNLOAD_PORT` - preferred recording server port, default `8765`
 - `DOWNLOAD_BASE_URL` - public base URL for recording links, default `http://127.0.0.1:8765`
 - `DOWNLOAD_PORT_SEARCH_ATTEMPTS` - number of ports to try starting from `DOWNLOAD_PORT`, default `20`
 - `RECORDINGS_DIR` - recording output directory, default temp path
-- `RECORDINGS_TTL_DAYS` - recording retention window, default `7`
+- `RECORDINGS_TTL_DAYS` - recording retention window in days, default `30`, capped at `31`
 - `CLEANUP_INTERVAL_SECONDS` - expired-recording cleanup interval, default `3600`
 - `AFK_DISCONNECT_SECONDS` - idle timeout before leaving voice, default `300`
 - `SPOTIFY_CLIENT_ID` - recommended for Spotify track, playlist, and album expansion
@@ -90,8 +94,9 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 - recording captures incoming user voice only
 - each speaker is written to a separate WAV file
 - `/recordstop` returns individual file links and a ZIP archive when audio was captured
-- completed recordings expire after 7 days by default
+- completed recordings expire after 30 days by default
 - set `DOWNLOAD_BASE_URL=https://recording.olavehome.uk` when you put the bot behind your reverse proxy
+- if Discord OAuth is configured, the recordings website can show a `My Sessions` view filtered to sessions that include the signed-in Discord user
 
 ## Notes
 
@@ -100,6 +105,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 - SoundCloud playback is enabled through `play-dl` and depends on its free client ID lookup succeeding at startup.
 - Commands are synced per guild on startup so they appear quickly in servers the bot is already in.
 - Discord voice receive is still not officially documented by Discord, but the Node voice stack here is the chosen path over the previous Python receive extension.
+- The website login uses Discord OAuth `identify` scope only. Session matching works by the Discord user IDs already embedded in per-user WAV filenames.
 
 ## Proxmox / LXC
 

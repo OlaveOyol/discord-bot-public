@@ -64,7 +64,7 @@ const DOWNLOAD_PORT_SEARCH_ATTEMPTS = Math.max(
   Number.parseInt(env("DOWNLOAD_PORT_SEARCH_ATTEMPTS", "20"), 10),
 );
 const RECORDINGS_DIR = env("RECORDINGS_DIR", path.join(os.tmpdir(), "discord-bot-recordings"));
-const RECORDINGS_TTL_DAYS = Math.max(1, Number.parseInt(env("RECORDINGS_TTL_DAYS", "7"), 10));
+const RECORDINGS_TTL_DAYS = Math.min(31, Math.max(1, Number.parseInt(env("RECORDINGS_TTL_DAYS", "30"), 10)));
 const CLEANUP_INTERVAL_SECONDS = Math.max(
   60,
   Number.parseInt(env("CLEANUP_INTERVAL_SECONDS", "3600"), 10),
@@ -79,6 +79,10 @@ const PLAYLIST_MAX_TRACKS = Math.max(
 );
 const SPOTIFY_CLIENT_ID = env("SPOTIFY_CLIENT_ID") || env("SPOTIPY_CLIENT_ID");
 const SPOTIFY_CLIENT_SECRET = env("SPOTIFY_CLIENT_SECRET") || env("SPOTIPY_CLIENT_SECRET");
+const DISCORD_CLIENT_ID = env("DISCORD_CLIENT_ID");
+const DISCORD_CLIENT_SECRET = env("DISCORD_CLIENT_SECRET");
+const DISCORD_REDIRECT_URI = env("DISCORD_REDIRECT_URI");
+const WEB_SESSION_SECRET = env("WEB_SESSION_SECRET") || env("SESSION_SECRET");
 
 fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
@@ -92,9 +96,13 @@ const SPOTIFY_URL_RE = /^https?:\/\/open\.spotify\.com\/(track|album|playlist)\/
 const SPOTIFY_TITLE_RE = /<meta property="og:title" content="([^"]+)"/i;
 const SPOTIFY_DESC_RE = /<meta property="og:description" content="([^"]+)"/i;
 const SPOTIFY_INITIAL_STATE_RE = /<script id="initialState" type="text\/plain">(.*?)<\/script>/is;
-const SEVEN_DAYS_MS = RECORDINGS_TTL_DAYS * 24 * 60 * 60 * 1000;
+const RECORDINGS_TTL_MS = RECORDINGS_TTL_DAYS * 24 * 60 * 60 * 1000;
 const LOCAL_YTDLP_PATH = path.join(BOT_DIR, ".venv", "Scripts", "yt-dlp.exe");
 const INSTANCE_LOCK_PATH = path.join(BOT_DIR, ".bot.lock");
+const RECORDING_METADATA_FILE = "session.json";
+const WEB_SESSION_COOKIE_NAME = "recfile_session";
+const OAUTH_STATE_COOKIE_NAME = "recfile_oauth";
+const WEB_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 let spotifyTokenCache = null;
 let downloadBaseUrl = DOWNLOAD_BASE_URL;
@@ -300,6 +308,147 @@ function formatBytes(value) {
   return `${size.toFixed(precision)} ${units[unitIndex]}`;
 }
 
+function parseParticipantIdsFromFileNames(fileNames) {
+  const ids = new Set();
+  for (const fileName of fileNames) {
+    const match = String(fileName).match(/_(\d{15,22})\.wav$/i);
+    if (match) {
+      ids.add(match[1]);
+    }
+  }
+  return [...ids].sort();
+}
+
+function hasDiscordWebAuth() {
+  return Boolean(DISCORD_CLIENT_ID && DISCORD_CLIENT_SECRET && DISCORD_REDIRECT_URI && WEB_SESSION_SECRET);
+}
+
+function parseCookieHeader(header) {
+  const cookies = {};
+  for (const entry of String(header || "").split(";")) {
+    const separatorIndex = entry.indexOf("=");
+    if (separatorIndex <= 0) {
+      continue;
+    }
+    const name = entry.slice(0, separatorIndex).trim();
+    const value = entry.slice(separatorIndex + 1).trim();
+    if (!name) {
+      continue;
+    }
+    cookies[name] = decodeURIComponent(value);
+  }
+  return cookies;
+}
+
+function base64UrlJson(value) {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+function hmacSignature(payload) {
+  return crypto.createHmac("sha256", WEB_SESSION_SECRET).update(payload).digest("base64url");
+}
+
+function encodeSignedPayload(payload) {
+  const encoded = base64UrlJson(payload);
+  return `${encoded}.${hmacSignature(encoded)}`;
+}
+
+function decodeSignedPayload(value) {
+  if (!WEB_SESSION_SECRET || typeof value !== "string") {
+    return null;
+  }
+  const separatorIndex = value.lastIndexOf(".");
+  if (separatorIndex <= 0) {
+    return null;
+  }
+
+  const encoded = value.slice(0, separatorIndex);
+  const providedSignature = value.slice(separatorIndex + 1);
+  const expectedSignature = hmacSignature(encoded);
+  const providedBuffer = Buffer.from(providedSignature, "utf8");
+  const expectedBuffer = Buffer.from(expectedSignature, "utf8");
+  if (
+    providedBuffer.length !== expectedBuffer.length ||
+    !crypto.timingSafeEqual(providedBuffer, expectedBuffer)
+  ) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    if (payload?.exp && Date.now() > payload.exp) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function isSecureCookieRequest() {
+  return downloadBaseUrl.startsWith("https://");
+}
+
+function serializeCookie(name, value, options = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`];
+  parts.push(`Path=${options.path || "/"}`);
+  if (options.maxAge !== undefined) {
+    parts.push(`Max-Age=${Math.max(0, Math.floor(options.maxAge))}`);
+  }
+  if (options.httpOnly !== false) {
+    parts.push("HttpOnly");
+  }
+  if (options.sameSite) {
+    parts.push(`SameSite=${options.sameSite}`);
+  } else {
+    parts.push("SameSite=Lax");
+  }
+  if (options.secure ?? isSecureCookieRequest()) {
+    parts.push("Secure");
+  }
+  return parts.join("; ");
+}
+
+function setCookie(res, name, value, options = {}) {
+  const serialized = serializeCookie(name, value, options);
+  const existing = res.getHeader("Set-Cookie");
+  if (!existing) {
+    res.setHeader("Set-Cookie", serialized);
+    return;
+  }
+
+  if (Array.isArray(existing)) {
+    res.setHeader("Set-Cookie", [...existing, serialized]);
+    return;
+  }
+
+  res.setHeader("Set-Cookie", [existing, serialized]);
+}
+
+function clearCookie(res, name) {
+  setCookie(res, name, "", { maxAge: 0 });
+}
+
+function getAuthenticatedRecordingUser(req) {
+  const cookies = parseCookieHeader(req.headers.cookie);
+  return decodeSignedPayload(cookies[WEB_SESSION_COOKIE_NAME]);
+}
+
+function sanitizeReturnPath(value) {
+  if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//")) {
+    return "/recordings/";
+  }
+  return value;
+}
+
+function discordAvatarUrl(user) {
+  if (!user?.id || !user?.avatar) {
+    return null;
+  }
+  const extension = user.avatar.startsWith("a_") ? "gif" : "png";
+  return `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.${extension}?size=128`;
+}
+
 function createTrack({
   title,
   webpageUrl,
@@ -378,11 +527,14 @@ class RecordingSession {
   constructor(guildId, channelId) {
     this.guildId = guildId;
     this.channelId = channelId;
+    this.guildName = null;
+    this.channelName = null;
     this.startedAt = new Date();
     this.completedAt = null;
     this.token = crypto.randomBytes(16).toString("base64url");
     this.directory = path.join(RECORDINGS_DIR, `${guildId}-${Date.now()}-${this.token}`);
     this.archivePath = null;
+    this.participantIds = null;
     this.receiver = null;
     this.connection = null;
     this.speakingListener = null;
@@ -401,7 +553,7 @@ class RecordingSession {
 
   expiresAt() {
     const reference = this.completedAt || this.startedAt;
-    return new Date(reference.getTime() + SEVEN_DAYS_MS);
+    return new Date(reference.getTime() + RECORDINGS_TTL_MS);
   }
 
   isExpired(now = Date.now()) {
@@ -500,6 +652,7 @@ class RecordingSession {
       this.archivePath = path.join(this.directory, "session.zip");
       await createZipArchive(this.directory, this.archivePath, wavFiles);
     }
+    await this.writeMetadata();
   }
 
   async wavFiles() {
@@ -508,6 +661,28 @@ class RecordingSession {
       .filter((entry) => entry.isFile() && entry.name.endsWith(".wav"))
       .map((entry) => entry.name)
       .sort();
+  }
+
+  metadataPath() {
+    return path.join(this.directory, RECORDING_METADATA_FILE);
+  }
+
+  async writeMetadata() {
+    const wavFiles = await this.wavFiles();
+    const payload = {
+      version: 1,
+      token: this.token,
+      guildId: this.guildId,
+      guildName: this.guildName || null,
+      channelId: this.channelId || null,
+      channelName: this.channelName || null,
+      startedAt: this.startedAt.toISOString(),
+      completedAt: this.completedAt ? this.completedAt.toISOString() : null,
+      participantIds: parseParticipantIdsFromFileNames(wavFiles),
+      files: wavFiles,
+      archiveName: this.archivePath ? path.basename(this.archivePath) : null,
+    };
+    await fsp.writeFile(this.metadataPath(), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   }
 }
 
@@ -523,17 +698,24 @@ async function restoreRecordingSessionFromDirectory(directoryPath) {
   const archivePath = path.join(directoryPath, "session.zip");
   const archiveStat = await fsp.stat(archivePath).catch(() => null);
   const directoryStat = await fsp.stat(directoryPath).catch(() => null);
+  const metadata = await fsp
+    .readFile(path.join(directoryPath, RECORDING_METADATA_FILE), "utf8")
+    .then((content) => JSON.parse(content))
+    .catch(() => null);
 
   const session = Object.create(RecordingSession.prototype);
   session.guildId = guildId;
-  session.channelId = null;
-  session.guildName = null;
-  session.channelName = null;
-  session.startedAt = startedAt;
-  session.completedAt = archiveStat?.mtime || directoryStat?.mtime || startedAt;
+  session.channelId = metadata?.channelId || null;
+  session.guildName = metadata?.guildName || null;
+  session.channelName = metadata?.channelName || null;
+  session.startedAt = metadata?.startedAt ? new Date(metadata.startedAt) : startedAt;
+  session.completedAt = metadata?.completedAt
+    ? new Date(metadata.completedAt)
+    : archiveStat?.mtime || directoryStat?.mtime || startedAt;
   session.token = token;
   session.directory = directoryPath;
   session.archivePath = archiveStat ? archivePath : null;
+  session.participantIds = Array.isArray(metadata?.participantIds) ? metadata.participantIds : null;
   session.receiver = null;
   session.connection = null;
   session.speakingListener = null;
@@ -601,66 +783,49 @@ async function listRecordingSessions() {
   });
 }
 
-async function renderRecordingIndexPage() {
-  const sessions = await listRecordingSessions();
-  const rows = await Promise.all(
-    sessions.map(async (session) => {
-      const wavFiles = await session.wavFiles();
-      const wavStats = await Promise.all(
-        wavFiles.map(async (name) => {
-          const filePath = path.join(session.directory, name);
-          const stat = await fsp.stat(filePath).catch(() => null);
-          return { name, size: stat?.size || 0 };
-        }),
-      );
-      const totalSize =
-        wavStats.reduce((sum, file) => sum + file.size, 0) +
-        ((await fsp.stat(session.archivePath).catch(() => null))?.size || 0);
-      const status = session.completedAt ? "Ready" : "Recording";
-      const title = session.guildName || `Guild ${session.guildId}`;
-      const subtitle = [
-        session.channelName ? `Channel ${escapeHtml(session.channelName)}` : `Session ${escapeHtml(session.token.slice(0, 8))}`,
-        `${wavFiles.length} file${wavFiles.length === 1 ? "" : "s"}`,
-        formatBytes(totalSize),
-      ].join(" • ");
-      const fileList = wavStats
-        .slice(0, 4)
-        .map(
-          (file) =>
-            `<a class="file-chip" href="/recordings/${encodeURIComponent(session.token)}/${encodeURIComponent(file.name)}">${escapeHtml(file.name)} <span>${formatBytes(file.size)}</span></a>`,
-        )
-        .join("");
-      const zipLink = session.archivePath
-        ? `<a class="action" href="/recordings/${encodeURIComponent(session.token)}/session.zip">Download ZIP</a>`
-        : "";
-
-      return `
-        <article class="row" data-status="${status.toLowerCase()}" data-sort="${(session.completedAt || session.startedAt).getTime()}" data-label="${escapeHtml(`${title} ${subtitle}`.toLowerCase())}">
-          <div class="row-main">
-            <div class="row-icon">${session.completedAt ? "🗂" : "●"}</div>
-            <div class="row-copy">
-              <h2>${escapeHtml(title)}</h2>
-              <p class="meta">${subtitle}</p>
-              <p class="meta">Started ${escapeHtml(formatDateTime(session.startedAt))}${session.completedAt ? ` • Completed ${escapeHtml(formatDateTime(session.completedAt))}` : ""}</p>
-              <div class="chip-row">${fileList || '<span class="muted">No WAV files captured yet.</span>'}</div>
-            </div>
-          </div>
-          <div class="row-side">
-            <span class="badge badge-${status.toLowerCase()}">${status}</span>
-            <span class="meta">Expires ${escapeHtml(formatDateTime(session.expiresAt()))}</span>
-          </div>
-          <div class="row-actions">
-            <a class="action" href="/recordings/${encodeURIComponent(session.token)}/">Open</a>
-            ${zipLink}
-          </div>
-        </article>
-      `;
+async function summarizeRecordingSession(session) {
+  const wavFiles = await session.wavFiles();
+  const wavStats = await Promise.all(
+    wavFiles.map(async (name) => {
+      const filePath = path.join(session.directory, name);
+      const stat = await fsp.stat(filePath).catch(() => null);
+      return { name, size: stat?.size || 0 };
     }),
   );
+  const archiveSize = ((await fsp.stat(session.archivePath).catch(() => null))?.size || 0);
+  const participantIds =
+    Array.isArray(session.participantIds) && session.participantIds.length > 0
+      ? [...session.participantIds]
+      : parseParticipantIdsFromFileNames(wavFiles);
+  session.participantIds = participantIds;
 
-  const readyCount = sessions.filter((session) => Boolean(session.completedAt)).length;
-  const liveCount = sessions.length - readyCount;
+  return {
+    session,
+    wavFiles,
+    wavStats,
+    archiveSize,
+    participantIds,
+    totalSize: wavStats.reduce((sum, file) => sum + file.size, 0) + archiveSize,
+    status: session.completedAt ? "Ready" : "Recording",
+    title: session.guildName || `Guild ${session.guildId}`,
+    subtitle: [
+      session.channelName ? `Channel ${session.channelName}` : `Session ${session.token.slice(0, 8)}`,
+      `${wavFiles.length} file${wavFiles.length === 1 ? "" : "s"}`,
+    ].join(" • "),
+  };
+}
 
+function renderLibraryPage({
+  currentPath,
+  accountCard,
+  heroText,
+  toolbarLabel,
+  sessionCountLabel,
+  readyCount,
+  liveCount,
+  rowsMarkup,
+  emptyMarkup,
+}) {
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -677,10 +842,13 @@ async function renderRecordingIndexPage() {
       .brand { display: flex; align-items: center; gap: 12px; font-size: 1.8rem; font-weight: 800; margin-bottom: 24px; }
       .brand-mark { width: 42px; height: 42px; display: grid; place-items: center; background: linear-gradient(135deg, #facc15, #f59e0b); border-radius: 12px; color: #111827; }
       .account { padding: 14px 16px; border: 1px solid #3557a6; border-radius: 12px; background: #222d41; margin-bottom: 18px; }
+      .account-user { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+      .avatar { width: 42px; height: 42px; border-radius: 50%; background: linear-gradient(135deg, #4f46e5, #06b6d4); background-size: cover; background-position: center; display: inline-block; }
       .account small { display: block; color: #91a3c7; margin-bottom: 4px; }
       .account strong { display: block; font-size: 1rem; }
+      .account-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
       .nav { margin-top: 26px; display: grid; gap: 10px; }
-      .nav-item { padding: 11px 12px; border-radius: 10px; color: #dce7fb; background: transparent; border: 1px solid transparent; }
+      .nav-item { display: block; padding: 11px 12px; border-radius: 10px; color: #dce7fb; background: transparent; border: 1px solid transparent; }
       .nav-item.active { background: #243149; border-color: #3557a6; }
       .sidebar-foot { margin-top: 28px; color: #8ea1c4; font-size: 0.92rem; line-height: 1.5; }
       .content { padding: 8px 14px 18px; }
@@ -709,6 +877,7 @@ async function renderRecordingIndexPage() {
       .badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; font-size: 0.84rem; font-weight: 700; }
       .badge-ready { background: rgba(34,197,94,.18); color: #86efac; }
       .badge-recording { background: rgba(239,68,68,.18); color: #fca5a5; }
+      .badge-match { background: rgba(59,130,246,.18); color: #93c5fd; }
       .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
       .stat { background: #1c2638; border: 1px solid #2e3a52; border-radius: 14px; padding: 14px 16px; }
       .stat small { display: block; color: #90a4c7; margin-bottom: 4px; }
@@ -723,15 +892,13 @@ async function renderRecordingIndexPage() {
     <div class="layout">
       <aside class="sidebar">
         <div class="brand"><span class="brand-mark">📁</span><span>Recfile</span></div>
-        <div class="account">
-          <small>Library</small>
-          <strong>recording.olavehome.uk</strong>
-        </div>
+        ${accountCard}
         <nav class="nav">
-          <div class="nav-item active">Home</div>
-          <div class="nav-item">Recent Sessions</div>
-          <div class="nav-item">Archives</div>
-          <div class="nav-item">Help</div>
+          <a class="nav-item${currentPath === "/recordings/" ? " active" : ""}" href="/recordings/">Home</a>
+          <a class="nav-item${currentPath === "/recordings/mine/" ? " active" : ""}" href="/recordings/mine/">My Sessions</a>
+          <a class="nav-item" href="/recordings/">Recent Sessions</a>
+          <a class="nav-item" href="/recordings/">Archives</a>
+          <a class="nav-item" href="/recordings/">Help</a>
         </nav>
         <div class="sidebar-foot">
           Retention: ${RECORDINGS_TTL_DAYS} days<br>
@@ -740,14 +907,14 @@ async function renderRecordingIndexPage() {
       </aside>
       <main class="content">
         <div class="topbar"><div class="hamburger">☰</div></div>
-        <div class="hero">Browse recent recordings and choose the session or files you want to download.</div>
+        <div class="hero">${heroText}</div>
         <section class="stats">
-          <div class="stat"><small>Total sessions</small><strong id="sessionCount">${sessions.length}</strong></div>
+          <div class="stat"><small>${sessionCountLabel}</small><strong id="sessionCount">${rowsMarkup ? rowsMarkup.sessionCount : 0}</strong></div>
           <div class="stat"><small>Ready downloads</small><strong>${readyCount}</strong></div>
           <div class="stat"><small>Active captures</small><strong>${liveCount}</strong></div>
         </section>
         <section class="toolbar">
-          <div class="toolbar-left"><span>Showing recent sessions</span></div>
+          <div class="toolbar-left"><span>${toolbarLabel}</span></div>
           <div class="toolbar-right">
             <button class="control green" type="button" onclick="window.location.reload()">Refresh</button>
             <select id="sortSelect" class="control">
@@ -758,11 +925,7 @@ async function renderRecordingIndexPage() {
             <input id="searchInput" class="search" type="search" placeholder="Search sessions or files">
           </div>
         </section>
-        ${
-          rows.length > 0
-            ? `<section id="rows" class="table">${rows.join("")}</section>`
-            : '<section class="empty">No recording sessions are available right now.</section>'
-        }
+        ${rowsMarkup ? `<section id="rows" class="table">${rowsMarkup.rows}</section>` : emptyMarkup}
         <footer class="footer">
           <span>Home | Terms of Service | Privacy Policy | Contact</span>
           <span>Olavehome Recordings</span>
@@ -806,6 +969,100 @@ async function renderRecordingIndexPage() {
     </script>
   </body>
 </html>`;
+}
+
+async function renderRecordingIndexPage({ viewer = null, onlyParticipantId = null, currentPath = "/recordings/" } = {}) {
+  const summaries = (await Promise.all((await listRecordingSessions()).map((session) => summarizeRecordingSession(session))))
+    .filter((summary) => !onlyParticipantId || summary.participantIds.includes(onlyParticipantId));
+
+  const rows = summaries.map((summary) => {
+    const { session, wavStats, totalSize, status, title, subtitle, participantIds } = summary;
+    const viewerIncluded = Boolean(viewer?.id && participantIds.includes(viewer.id));
+    const fileList = wavStats
+      .slice(0, 4)
+      .map(
+        (file) =>
+          `<a class="file-chip" href="/recordings/${encodeURIComponent(session.token)}/${encodeURIComponent(file.name)}">${escapeHtml(file.name)} <span>${formatBytes(file.size)}</span></a>`,
+      )
+      .join("");
+    const zipLink = session.archivePath
+      ? `<a class="action" href="/recordings/${encodeURIComponent(session.token)}/session.zip">Download ZIP</a>`
+      : "";
+
+    return `
+      <article class="row" data-status="${status.toLowerCase()}" data-sort="${(session.completedAt || session.startedAt).getTime()}" data-label="${escapeHtml(`${title} ${subtitle} ${wavStats.map((file) => file.name).join(" ")}`.toLowerCase())}">
+        <div class="row-main">
+          <div class="row-icon">${session.completedAt ? "🗂" : "●"}</div>
+          <div class="row-copy">
+            <h2>${escapeHtml(title)}</h2>
+            <p class="meta">${escapeHtml(subtitle)} • ${formatBytes(totalSize)}</p>
+            <p class="meta">Started ${escapeHtml(formatDateTime(session.startedAt))}${session.completedAt ? ` • Completed ${escapeHtml(formatDateTime(session.completedAt))}` : ""}</p>
+            <div class="chip-row">${fileList || '<span class="muted">No WAV files captured yet.</span>'}</div>
+          </div>
+        </div>
+        <div class="row-side">
+          <span class="badge badge-${status.toLowerCase()}">${status}</span>
+          ${viewerIncluded ? '<span class="badge badge-match">Includes you</span>' : ""}
+          <span class="meta">Expires ${escapeHtml(formatDateTime(session.expiresAt()))}</span>
+        </div>
+        <div class="row-actions">
+          <a class="action" href="/recordings/${encodeURIComponent(session.token)}/">Open</a>
+          ${zipLink}
+        </div>
+      </article>
+    `;
+  });
+
+  const readyCount = summaries.filter((summary) => Boolean(summary.session.completedAt)).length;
+  const liveCount = summaries.length - readyCount;
+  const viewerName = viewer?.global_name || viewer?.globalName || viewer?.username || null;
+  const viewerAvatar = discordAvatarUrl(viewer);
+  const accountCard = viewer
+    ? `
+      <div class="account">
+        <small>Linked Discord</small>
+        <strong>${escapeHtml(viewerName || `User ${viewer.id}`)}</strong>
+        <div class="account-user">
+          <span class="avatar"${viewerAvatar ? ` style="background-image:url('${escapeHtml(viewerAvatar)}')"` : ""}></span>
+          <div>
+            <small>Signed in</small>
+            <strong>@${escapeHtml(viewer.username || viewerName || viewer.id)}</strong>
+          </div>
+        </div>
+        <div class="account-actions">
+          <a class="control" href="/recordings/mine/">My Sessions</a>
+          <a class="control" href="/auth/logout?next=${encodeURIComponent(currentPath)}">Logout</a>
+        </div>
+      </div>
+    `
+    : `
+      <div class="account">
+        <small>Library</small>
+        <strong>recording.olavehome.uk</strong>
+        ${
+          hasDiscordWebAuth()
+            ? `<div class="account-actions"><a class="action" href="/auth/discord/login?next=${encodeURIComponent(currentPath)}">Link Discord</a></div>`
+            : `<p class="meta">Discord linking is available once OAuth is configured.</p>`
+        }
+      </div>
+    `;
+
+  const rowsMarkup = rows.length > 0 ? { rows: rows.join(""), sessionCount: rows.length } : null;
+  return renderLibraryPage({
+    currentPath,
+    accountCard,
+    heroText: onlyParticipantId
+      ? `Showing sessions that include your voice capture${viewerName ? `, ${escapeHtml(viewerName)}` : ""}.`
+      : "Browse recent recordings and choose the session or files you want to download.",
+    toolbarLabel: onlyParticipantId ? "Showing your matched sessions" : "Showing recent sessions",
+    sessionCountLabel: onlyParticipantId ? "Matched sessions" : "Total sessions",
+    readyCount,
+    liveCount,
+    rowsMarkup,
+    emptyMarkup: hasDiscordWebAuth() && onlyParticipantId && !viewer
+      ? `<section class="empty">Sign in with Discord to view sessions that include your audio. <a class="action" href="/auth/discord/login?next=${encodeURIComponent(currentPath)}">Link Discord</a></section>`
+      : `<section class="empty">${onlyParticipantId ? "No sessions matching your Discord account were found yet." : "No recording sessions are available right now."}</section>`,
+  });
 }
 
 async function createZipArchive(directory, destination, wavFiles) {
@@ -2174,12 +2431,122 @@ function recordingLinkMessage(session, wavFiles) {
   return `Recording saved. Download files: ${links}${zipPart} | Expires: ${session.expiresAt().toISOString()}`;
 }
 
+function buildDiscordAuthorizationUrl(state) {
+  const params = new URLSearchParams({
+    client_id: DISCORD_CLIENT_ID,
+    response_type: "code",
+    redirect_uri: DISCORD_REDIRECT_URI,
+    scope: "identify",
+    state,
+    prompt: "consent",
+  });
+  return `https://discord.com/oauth2/authorize?${params.toString()}`;
+}
+
+async function exchangeDiscordCodeForToken(code) {
+  const params = new URLSearchParams({
+    client_id: DISCORD_CLIENT_ID,
+    client_secret: DISCORD_CLIENT_SECRET,
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: DISCORD_REDIRECT_URI,
+  });
+  const response = await fetch("https://discord.com/api/oauth2/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params,
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload?.access_token) {
+    throw new Error(payload?.error_description || payload?.error || "Discord OAuth token exchange failed.");
+  }
+  return payload.access_token;
+}
+
+async function fetchDiscordIdentity(accessToken) {
+  const response = await fetch("https://discord.com/api/users/@me", {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload?.id) {
+    throw new Error(payload?.message || "Discord user lookup failed.");
+  }
+  return payload;
+}
+
 async function startDownloadServer() {
   const app = express();
+  app.disable("x-powered-by");
 
-  app.get("/", async (_, res) => {
+  app.get("/auth/discord/login", async (req, res) => {
+    if (!hasDiscordWebAuth()) {
+      res.status(503).type("html").send("Discord web login is not configured.");
+      return;
+    }
+
+    const nextPath = sanitizeReturnPath(typeof req.query.next === "string" ? req.query.next : "/recordings/mine/");
+    const nonce = crypto.randomBytes(18).toString("base64url");
+    const statePayload = {
+      nonce,
+      nextPath,
+      exp: Date.now() + 10 * 60 * 1000,
+    };
+    setCookie(res, OAUTH_STATE_COOKIE_NAME, encodeSignedPayload(statePayload), {
+      maxAge: 10 * 60,
+    });
+    res.redirect(buildDiscordAuthorizationUrl(nonce));
+  });
+
+  app.get("/auth/discord/callback", async (req, res) => {
+    if (!hasDiscordWebAuth()) {
+      res.status(503).type("html").send("Discord web login is not configured.");
+      return;
+    }
+
+    try {
+      const cookies = parseCookieHeader(req.headers.cookie);
+      const storedState = decodeSignedPayload(cookies[OAUTH_STATE_COOKIE_NAME]);
+      const receivedState = typeof req.query.state === "string" ? req.query.state : "";
+      const code = typeof req.query.code === "string" ? req.query.code : "";
+      if (!storedState?.nonce || !receivedState || storedState.nonce !== receivedState || !code) {
+        throw new Error("Discord login state could not be validated.");
+      }
+
+      const accessToken = await exchangeDiscordCodeForToken(code);
+      const user = await fetchDiscordIdentity(accessToken);
+      setCookie(
+        res,
+        WEB_SESSION_COOKIE_NAME,
+        encodeSignedPayload({
+          id: user.id,
+          username: user.username,
+          globalName: user.global_name || null,
+          avatar: user.avatar || null,
+          exp: Date.now() + WEB_SESSION_TTL_MS,
+        }),
+        {
+          maxAge: WEB_SESSION_TTL_MS / 1000,
+        },
+      );
+      clearCookie(res, OAUTH_STATE_COOKIE_NAME);
+      res.redirect(sanitizeReturnPath(storedState.nextPath));
+    } catch (error) {
+      logger.warn(`Discord web login failed: ${error.message}`);
+      clearCookie(res, OAUTH_STATE_COOKIE_NAME);
+      res.status(400).type("html").send(`Discord login failed: ${escapeHtml(error.message)}`);
+    }
+  });
+
+  app.get("/auth/logout", (req, res) => {
+    clearCookie(res, WEB_SESSION_COOKIE_NAME);
+    clearCookie(res, OAUTH_STATE_COOKIE_NAME);
+    const nextPath = sanitizeReturnPath(typeof req.query.next === "string" ? req.query.next : "/recordings/");
+    res.redirect(nextPath);
+  });
+
+  app.get("/", async (req, res) => {
     await pruneExpiredRecordings();
-    res.type("html").send(await renderRecordingIndexPage());
+    res.type("html").send(await renderRecordingIndexPage({ viewer: getAuthenticatedRecordingUser(req) }));
   });
 
   app.get("/recordings", async (_, res) => {
@@ -2187,9 +2554,39 @@ async function startDownloadServer() {
     res.redirect("/recordings/");
   });
 
-  app.get("/recordings/", async (_, res) => {
+  app.get("/recordings/", async (req, res) => {
     await pruneExpiredRecordings();
-    res.type("html").send(await renderRecordingIndexPage());
+    res.type("html").send(await renderRecordingIndexPage({ viewer: getAuthenticatedRecordingUser(req) }));
+  });
+
+  app.get("/recordings/mine", async (_, res) => {
+    await pruneExpiredRecordings();
+    res.redirect("/recordings/mine/");
+  });
+
+  app.get("/recordings/mine/", async (req, res) => {
+    await pruneExpiredRecordings();
+    if (!hasDiscordWebAuth()) {
+      res
+        .status(503)
+        .type("html")
+        .send("Discord web login is not configured yet. Set DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI, and WEB_SESSION_SECRET.");
+      return;
+    }
+
+    const viewer = getAuthenticatedRecordingUser(req);
+    if (!viewer?.id) {
+      res.redirect(`/auth/discord/login?next=${encodeURIComponent("/recordings/mine/")}`);
+      return;
+    }
+
+    res.type("html").send(
+      await renderRecordingIndexPage({
+        viewer,
+        onlyParticipantId: viewer.id,
+        currentPath: "/recordings/mine/",
+      }),
+    );
   });
 
   app.get("/recordings/:token/", async (req, res) => {
@@ -2433,6 +2830,8 @@ async function handleCommand(interaction) {
       await state.updateReceiveMode(true);
 
       const session = new RecordingSession(guildId, member.voice.channel.id);
+      session.guildName = guild.name;
+      session.channelName = member.voice.channel.name;
       session.attach(connection, guild);
       state.recording = session;
       await state.refreshState();
