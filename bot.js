@@ -2419,7 +2419,9 @@ async function startDownloadServer() {
   const renderHome = async (req) => {
     const viewer = getAuthenticatedRecordingUser(req);
     const viewerModel = buildViewerModel(viewer);
-    const summaries = await loadRecordingSummaries();
+    const summaries = viewer?.id
+      ? (await loadRecordingSummaries()).filter((summary) => summary.participantIds.includes(viewer.id))
+      : [];
     const stats = buildRecordingStats(summaries, viewer?.id || null);
     return renderRecordingsHomePage({
       viewer: viewerModel,
@@ -2428,10 +2430,10 @@ async function startDownloadServer() {
       storageRoot: RECORDINGS_DIR,
       recentWindowDays: RECENT_RECORDINGS_DAYS,
       stats: [
-        { id: "sessionCount", label: "Total sessions", value: String(stats.total) },
+        { id: "sessionCount", label: "My sessions", value: String(stats.total) },
         { label: `Recent (${RECENT_RECORDINGS_DAYS}d)`, value: String(stats.recent) },
         { label: "Archives", value: String(stats.archived) },
-        { label: viewerModel ? "My sessions" : "Active captures", value: String(viewerModel ? stats.mine : stats.active) },
+        { label: "Active captures", value: String(stats.active) },
       ],
     });
   };
@@ -2439,7 +2441,10 @@ async function startDownloadServer() {
   const renderListPage = async (req, { currentPath, heroText, toolbarLabel, sessionCountLabel, filter, emptyText }) => {
     const viewer = getAuthenticatedRecordingUser(req);
     const viewerModel = buildViewerModel(viewer);
-    const summaries = (await loadRecordingSummaries()).filter(filter);
+    const baseSummaries = viewer?.id
+      ? (await loadRecordingSummaries()).filter((summary) => summary.participantIds.includes(viewer.id))
+      : [];
+    const summaries = baseSummaries.filter(filter);
     const stats = buildRecordingStats(summaries, viewer?.id || null);
     return renderRecordingsListPage({
       viewer: viewerModel,
@@ -2542,11 +2547,15 @@ async function startDownloadServer() {
     res.type("html").send(
       await renderListPage(req, {
         currentPath: "/recordings/recent/",
-        heroText: `Recent Sessions contains recordings captured in the last ${RECENT_RECORDINGS_DAYS} days.`,
-        toolbarLabel: "Showing recent sessions",
+        heroText: getAuthenticatedRecordingUser(req)?.id
+          ? `Recent Sessions contains your recordings from the last ${RECENT_RECORDINGS_DAYS} days.`
+          : "Sign in with Discord to see your recent recordings.",
+        toolbarLabel: "Showing your recent sessions",
         sessionCountLabel: "Recent sessions",
         filter: (summary) => isRecentRecordingSession(summary.session),
-        emptyText: "No recent recording sessions are available right now.",
+        emptyText: hasDiscordWebAuth()
+          ? 'Sign in with Discord to view your recent recordings. Use the "Link Discord" button in the sidebar.'
+          : "No recent recording sessions are available right now.",
       }),
     );
   });
@@ -2556,11 +2565,15 @@ async function startDownloadServer() {
     res.type("html").send(
       await renderListPage(req, {
         currentPath: "/recordings/archives/",
-        heroText: `Archives contains recordings older than ${RECENT_RECORDINGS_DAYS} days. These are stored as smaller compressed files.`,
-        toolbarLabel: "Showing archived sessions",
+        heroText: getAuthenticatedRecordingUser(req)?.id
+          ? `Archives contains your recordings older than ${RECENT_RECORDINGS_DAYS} days. These are stored as smaller compressed files.`
+          : "Sign in with Discord to see your archived recordings.",
+        toolbarLabel: "Showing your archived sessions",
         sessionCountLabel: "Archived sessions",
         filter: (summary) => isArchivedRecordingSummary(summary),
-        emptyText: "No archived sessions are available yet.",
+        emptyText: hasDiscordWebAuth()
+          ? 'Sign in with Discord to view your archived recordings. Use the "Link Discord" button in the sidebar.'
+          : "No archived sessions are available yet.",
       }),
     );
   });
@@ -2608,7 +2621,7 @@ async function startDownloadServer() {
       await renderListPage(req, {
         currentPath: "/recordings/mine/",
         heroText: `Showing all recordings that include your voice capture, ${viewer.global_name || viewer.globalName || viewer.username}.`,
-        toolbarLabel: "Showing your matched sessions",
+        toolbarLabel: "Showing all of your matched sessions",
         sessionCountLabel: "Matched sessions",
         filter: (summary) => summary.participantIds.includes(viewer.id),
         emptyText: "No recordings matching your Discord account were found yet.",
