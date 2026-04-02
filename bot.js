@@ -1496,6 +1496,17 @@ class GuildState {
           }
           break;
         } catch (error) {
+          if ((nextTrack.resumeOffsetMs || 0) > 0) {
+            logger.warn(
+              `Failed to resume '${nextTrack.title}' in guild ${this.guildId} at ${Math.floor(nextTrack.resumeOffsetMs / 1000)}s; retrying from the start: ${error.message}`,
+            );
+            nextTrack.resumeOffsetMs = 0;
+            this.queue.unshift(nextTrack);
+            this.current = null;
+            this.currentOffsetMs = 0;
+            this.playbackStartedAtMs = null;
+            continue;
+          }
           logger.warn(`Failed to play track in guild ${this.guildId}: ${error.message}`);
           this.current = null;
           this.currentOffsetMs = 0;
@@ -2626,9 +2637,20 @@ async function refreshRecordingNickname(guildId) {
     if (currentNickname === targetNickname) {
       return;
     }
-    await guild.members.edit(client.user.id, { nick: targetNickname, reason: "Recording active" }).catch((error) => {
-      logger.warn(`Failed to set recording nickname in guild ${guildId}: ${error.message}`);
+    let updated = false;
+    await me.setNickname(targetNickname, "Recording active").then(() => {
+      updated = true;
+    }).catch(async (error) => {
+      logger.warn(`Primary nickname update failed in guild ${guildId}: ${error.message}`);
+      await guild.members.edit(client.user.id, { nick: targetNickname, reason: "Recording active" }).then(() => {
+        updated = true;
+      }).catch((fallbackError) => {
+        logger.warn(`Failed to set recording nickname in guild ${guildId}: ${fallbackError.message}`);
+      });
     });
+    if (updated) {
+      logger.info(`Recording nickname enabled in guild ${guildId}.`);
+    }
     return;
   }
 
@@ -2645,9 +2667,20 @@ async function refreshRecordingNickname(guildId) {
     state.baseNickname = undefined;
     return;
   }
-  await guild.members.edit(client.user.id, { nick: restoreNickname, reason: "Recording inactive" }).catch((error) => {
-    logger.warn(`Failed to restore nickname in guild ${guildId}: ${error.message}`);
+  let restored = false;
+  await me.setNickname(restoreNickname, "Recording inactive").then(() => {
+    restored = true;
+  }).catch(async (error) => {
+    logger.warn(`Primary nickname restore failed in guild ${guildId}: ${error.message}`);
+    await guild.members.edit(client.user.id, { nick: restoreNickname, reason: "Recording inactive" }).then(() => {
+      restored = true;
+    }).catch((fallbackError) => {
+      logger.warn(`Failed to restore nickname in guild ${guildId}: ${fallbackError.message}`);
+    });
   });
+  if (restored) {
+    logger.info(`Recording nickname cleared in guild ${guildId}.`);
+  }
   state.baseNickname = undefined;
 }
 
