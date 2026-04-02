@@ -663,6 +663,7 @@ class RecordingSession {
       void this.subscribeUser(guild, userId);
     };
     this.receiver.speaking.on("start", this.speakingListener);
+    this.subscribePresentMembers(guild);
   }
 
   getWriter(guild, userId) {
@@ -678,6 +679,22 @@ class RecordingSession {
     writer = new WaveFileWriter(path.join(this.directory, fileName));
     this.fileWriters.set(userId, writer);
     return writer;
+  }
+
+  subscribePresentMembers(guild) {
+    const channel = guild.channels.cache.get(this.channelId);
+    if (!channel?.members) {
+      return;
+    }
+
+    for (const [userId, member] of channel.members) {
+      if (member.user?.bot) {
+        continue;
+      }
+      void this.subscribeUser(guild, userId).catch((error) => {
+        logger.warn(`Recording subscribe error for user ${userId} in guild ${guild.id}: ${error.message}`);
+      });
+    }
   }
 
   timelineBytePosition(reference = process.hrtime.bigint()) {
@@ -707,7 +724,6 @@ class RecordingSession {
       channels: 2,
       frameSize: 960,
     });
-    const writer = this.getWriter(guild, userId);
 
     const destroyEntry = ({ resubscribe = false } = {}) => {
       const entry = this.userStreams.get(userId);
@@ -741,10 +757,17 @@ class RecordingSession {
       destroyEntry({ resubscribe: true });
     });
     decoder.on("data", (chunk) => {
+      const entry = this.userStreams.get(userId);
+      if (!entry) {
+        return;
+      }
       const chunkLength = Math.floor(chunk.length / PCM_BLOCK_ALIGN) * PCM_BLOCK_ALIGN;
       if (chunkLength <= 0) {
         return;
       }
+      const writer = entry.writer || this.getWriter(guild, userId);
+      entry.writer = writer;
+      entry.receivedPcmBytes += chunkLength;
       const targetEnd = this.timelineBytePosition();
       const targetStart = Math.max(writer.dataBytes, targetEnd - chunkLength);
       writer.padToBytePosition(targetStart);
@@ -753,7 +776,7 @@ class RecordingSession {
     opusStream.once("end", () => destroyEntry());
     opusStream.once("close", () => destroyEntry());
     opusStream.pipe(decoder);
-    this.userStreams.set(userId, { opusStream, decoder });
+    this.userStreams.set(userId, { opusStream, decoder, writer: null, receivedPcmBytes: 0 });
   }
 
   async stop() {
@@ -3168,6 +3191,18 @@ client.on("voiceStateUpdate", (oldState, newState) => {
   const guildId = newState.guild.id || oldState.guild.id;
   if (guildId) {
     void refreshVoiceLifecycle(guildId);
+  }
+
+  const state = guildId ? getGuildState(guildId) : null;
+  const recording = state?.recording;
+  if (
+    recording &&
+    newState.channelId === recording.channelId &&
+    !newState.member?.user?.bot
+  ) {
+    void recording.subscribeUser(newState.guild, newState.id).catch((error) => {
+      logger.warn(`Recording subscribe error for user ${newState.id} in guild ${guildId}: ${error.message}`);
+    });
   }
 });
 
