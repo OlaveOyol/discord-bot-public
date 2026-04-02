@@ -10,8 +10,11 @@ const { execFile, spawn } = require("node:child_process");
 const archiver = require("archiver");
 const dotenv = require("dotenv");
 const express = require("express");
+const { registerOtaRoutes } = require("./ota-routes");
+const { createOtaRuntime } = require("./ota-runtime");
 const play = require("play-dl");
 const prism = require("prism-media");
+const { formatRuntimeVersion, getRuntimeVersion } = require("./runtime-version");
 const {
   renderRecordingAccessDeniedPage,
   renderRecordingsHelpPage,
@@ -73,6 +76,8 @@ const DOWNLOAD_PORT_SEARCH_ATTEMPTS = Math.max(
 );
 const RECORDINGS_DIR = env("RECORDINGS_DIR", path.join(os.tmpdir(), "discord-bot-recordings"));
 const PLAYBACK_STATE_PATH = env("PLAYBACK_STATE_PATH", path.join(RECORDINGS_DIR, "_playback-state.json"));
+const UPDATE_STATE_PATH = env("UPDATE_STATE_PATH", path.join(RECORDINGS_DIR, "_update-state.json"));
+const UPDATE_MANIFEST_PATH = env("UPDATE_MANIFEST_PATH", path.join(RECORDINGS_DIR, "_staged-release-manifest.json"));
 const RECORDING_NICKNAME_INDICATOR = " 🔴";
 const RESUME_EARLY_END_THRESHOLD_MS = 5_000;
 const RECORDINGS_TTL_DAYS = Math.min(31, Math.max(1, Number.parseInt(env("RECORDINGS_TTL_DAYS", "30"), 10)));
@@ -88,6 +93,22 @@ const AFK_DISCONNECT_SECONDS = Math.max(
   30,
   Number.parseInt(env("AFK_DISCONNECT_SECONDS", "300"), 10),
 );
+const GLOBAL_IDLE_COMMAND_COOLDOWN_SECONDS = Math.max(
+  15,
+  Number.parseInt(env("GLOBAL_IDLE_COMMAND_COOLDOWN_SECONDS", "90"), 10),
+);
+const UPDATE_STATE_POLL_SECONDS = Math.max(
+  5,
+  Number.parseInt(env("UPDATE_STATE_POLL_SECONDS", "15"), 10),
+);
+const SECURITY_UPDATE_DRAIN_SECONDS = Math.max(
+  15,
+  Number.parseInt(env("SECURITY_UPDATE_DRAIN_SECONDS", "120"), 10),
+);
+const SUPERVISOR_PREPARE_TIMEOUT_SECONDS = Math.max(
+  15,
+  Number.parseInt(env("SUPERVISOR_PREPARE_TIMEOUT_SECONDS", "180"), 10),
+);
 const PLAYLIST_MAX_TRACKS = Math.max(
   1,
   Number.parseInt(env("PLAYLIST_MAX_TRACKS", "200"), 10),
@@ -98,6 +119,7 @@ const DISCORD_CLIENT_ID = env("DISCORD_CLIENT_ID");
 const DISCORD_CLIENT_SECRET = env("DISCORD_CLIENT_SECRET");
 const DISCORD_REDIRECT_URI = env("DISCORD_REDIRECT_URI");
 const WEB_SESSION_SECRET = env("WEB_SESSION_SECRET") || env("SESSION_SECRET");
+const SUPERVISOR_TOKEN = env("SUPERVISOR_TOKEN");
 
 fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
@@ -135,6 +157,12 @@ const PCM_BITS_PER_SAMPLE = 16;
 const PCM_BYTES_PER_SAMPLE = PCM_BITS_PER_SAMPLE / 8;
 const PCM_BLOCK_ALIGN = PCM_CHANNELS * PCM_BYTES_PER_SAMPLE;
 const PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_BLOCK_ALIGN;
+const GLOBAL_IDLE_COMMAND_COOLDOWN_MS = GLOBAL_IDLE_COMMAND_COOLDOWN_SECONDS * 1000;
+const SECURITY_UPDATE_DRAIN_MS = SECURITY_UPDATE_DRAIN_SECONDS * 1000;
+const SUPERVISOR_PREPARE_TIMEOUT_MS = SUPERVISOR_PREPARE_TIMEOUT_SECONDS * 1000;
+const LOOPBACK_REMOTE_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+const SUPERVISOR_CONTRACT_VERSION = 1;
+const RUNTIME_VERSION = getRuntimeVersion();
 
 let spotifyTokenCache = null;
 let downloadBaseUrl = DOWNLOAD_BASE_URL;
@@ -145,9 +173,31 @@ let soundCloudReady = false;
 const guildStates = new Map();
 const completedRecordings = new Map();
 const latestRecordingByGuild = new Map();
+const meaningfulPlayerActions = new Set(["pause_resume", "previous", "skip", "stop", "shuffle"]);
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+});
+
+const otaRuntime = createOtaRuntime({
+  logger,
+  runtimeVersion: RUNTIME_VERSION,
+  formatRuntimeVersion,
+  updateStatePath: UPDATE_STATE_PATH,
+  updateManifestPath: UPDATE_MANIFEST_PATH,
+  globalIdleCommandCooldownMs: GLOBAL_IDLE_COMMAND_COOLDOWN_MS,
+  globalIdleCommandCooldownSeconds: GLOBAL_IDLE_COMMAND_COOLDOWN_SECONDS,
+  securityUpdateDrainMs: SECURITY_UPDATE_DRAIN_MS,
+  supervisorPrepareTimeoutMs: SUPERVISOR_PREPARE_TIMEOUT_MS,
+  supervisorPrepareTimeoutSeconds: SUPERVISOR_PREPARE_TIMEOUT_SECONDS,
+  supervisorToken: SUPERVISOR_TOKEN,
+  supervisorContractVersion: SUPERVISOR_CONTRACT_VERSION,
+  loopbackRemoteAddresses: LOOPBACK_REMOTE_ADDRESSES,
+  formatDateTime,
+  getGuildStates: () => guildStates.values(),
+  getUptimeSeconds: () => Math.floor(process.uptime()),
+  savePlaybackSnapshot,
+  finalizeActiveUpdateWork,
 });
 
 let instanceLockFd = null;
@@ -432,6 +482,27 @@ function formatDateTime(value) {
     return "Unknown";
   }
   return date.toISOString().replace("T", " ").replace(".000Z", " UTC");
+}
+
+async function finalizeActiveUpdateWork() {
+  let finalizedRecordings = 0;
+  for (const state of guildStates.values()) {
+    if (!state.recording) {
+      continue;
+    }
+
+    const session = state.recording;
+    state.recording = null;
+    await finalizeRecording(session, state.guild).catch((error) => {
+      logger.warn(`Failed to finalize recording during update apply prep in guild ${state.guildId}: ${error.message}`);
+    });
+    await state.updateReceiveMode(false).catch(() => {});
+    await refreshRecordingNickname(state.guildId).catch(() => {});
+    await state.refreshState().catch(() => {});
+    finalizedRecordings += 1;
+  }
+
+  return { finalizedRecordings };
 }
 
 function formatBytes(value) {
@@ -3017,6 +3088,21 @@ async function startDownloadServer() {
   const app = express();
   app.disable("x-powered-by");
 
+  app.get("/healthz", async (_req, res) => {
+    await otaRuntime.syncPendingUpdateState();
+    const snapshot = otaRuntime.buildHealthSnapshot();
+    res.setHeader("Cache-Control", "no-store");
+    res.status(snapshot.status === "unhealthy" ? 503 : 200).json(snapshot);
+  });
+
+  app.get("/readyz", async (_req, res) => {
+    await otaRuntime.syncPendingUpdateState();
+    const snapshot = otaRuntime.buildHealthSnapshot();
+    res.setHeader("Cache-Control", "no-store");
+    res.status(snapshot.ready ? 200 : 503).json(snapshot);
+  });
+  registerOtaRoutes(app, { logger, otaRuntime });
+
   const renderHome = async (req) => {
     const viewer = getAuthenticatedRecordingUser(req);
     const viewerModel = buildViewerModel(viewer);
@@ -3435,11 +3521,13 @@ async function handlePlay(interaction, { next = false } = {}) {
   if (!guild) {
     throw new Error("This command must be used in a guild.");
   }
+  otaRuntime.assertLongLivedActionAllowed(next ? "queue more playback" : "start playback");
   const state = getGuildState(guild.id);
   const member = await requireSameVoiceContext(interaction, state, {
     actionDescription: next ? "queue tracks next" : "queue music",
     requireVoiceWhenDisconnected: true,
   });
+  otaRuntime.trackMeaningfulActivity(next ? "playnext command" : "play command");
   await interaction.deferReply();
   state.controllerChannelId = interaction.channelId;
   await state.ensureConnection(member, { requireReceive: Boolean(state.recording) });
@@ -3476,6 +3564,7 @@ async function handleCommand(interaction) {
   const guild = interaction.guild;
   const guildId = interaction.guildId;
   const state = guildId ? getGuildState(guildId) : null;
+  await otaRuntime.syncPendingUpdateState();
 
   switch (interaction.commandName) {
     case "ping":
@@ -3486,12 +3575,14 @@ async function handleCommand(interaction) {
         actionDescription: "make the bot join voice",
         requireVoiceWhenDisconnected: true,
       });
+      otaRuntime.trackMeaningfulActivity("join command");
       await state.ensureConnection(member, { requireReceive: Boolean(state.recording) });
       await interaction.reply({ content: "Joined your voice channel.", ephemeral: true });
       return;
     }
     case "leave":
       await requireSameVoiceContext(interaction, state, { actionDescription: "make the bot leave voice" });
+      otaRuntime.trackMeaningfulActivity("leave command");
       await interaction.deferReply({ ephemeral: true });
       await disconnectGuild(guildId, "Manual leave requested");
       await safeReply(interaction, "Disconnected from voice and cleared playback state.", { ephemeral: true });
@@ -3504,24 +3595,28 @@ async function handleCommand(interaction) {
       return;
     case "skip": {
       await requireSameVoiceContext(interaction, state, { actionDescription: "skip tracks" });
+      otaRuntime.trackMeaningfulActivity("skip command");
       const skipped = await state.skip();
       await interaction.reply({ content: skipped ? "Skipped." : "Nothing is playing.", ephemeral: true });
       return;
     }
     case "pause": {
       await requireSameVoiceContext(interaction, state, { actionDescription: "pause playback" });
+      otaRuntime.trackMeaningfulActivity("pause command");
       const paused = await state.pause();
       await interaction.reply({ content: paused ? "Paused." : "Nothing is playing.", ephemeral: true });
       return;
     }
     case "resume": {
       await requireSameVoiceContext(interaction, state, { actionDescription: "resume playback" });
+      otaRuntime.trackMeaningfulActivity("resume command");
       const resumed = await state.resume();
       await interaction.reply({ content: resumed ? "Resumed." : "Nothing is paused.", ephemeral: true });
       return;
     }
     case "stop":
       await requireSameVoiceContext(interaction, state, { actionDescription: "stop playback" });
+      otaRuntime.trackMeaningfulActivity("stop command");
       await state.stopPlayback();
       await interaction.reply({ content: "Stopped.", ephemeral: true });
       return;
@@ -3536,6 +3631,7 @@ async function handleCommand(interaction) {
     }
     case "shuffle": {
       await requireSameVoiceContext(interaction, state, { actionDescription: "shuffle the queue" });
+      otaRuntime.trackMeaningfulActivity("shuffle command");
       const shuffled = await state.shuffleQueue();
       await interaction.reply({
         content: shuffled ? "Queue shuffled." : "Need at least 2 queued tracks.",
@@ -3544,6 +3640,7 @@ async function handleCommand(interaction) {
       return;
     }
     case "recordstart": {
+      otaRuntime.assertLongLivedActionAllowed("start a new recording");
       const member = await requireSameVoiceContext(interaction, state, {
         actionDescription: "start recording",
         requireVoiceWhenDisconnected: true,
@@ -3552,6 +3649,7 @@ async function handleCommand(interaction) {
         throw new Error("Recording is already active in this guild.");
       }
 
+      otaRuntime.trackMeaningfulActivity("recordstart command");
       await interaction.deferReply();
       const connection = await state.ensureConnection(member, { requireReceive: true });
       await state.updateReceiveMode(true);
@@ -3572,6 +3670,7 @@ async function handleCommand(interaction) {
         throw new Error("There is no active recording in this guild.");
       }
 
+      otaRuntime.trackMeaningfulActivity("recordstop command");
       await interaction.deferReply();
       const session = state.recording;
       state.recording = null;
@@ -3604,7 +3703,11 @@ async function handleCommand(interaction) {
       return;
     }
     case "status": {
+      const health = otaRuntime.buildHealthSnapshot();
+      const policy = otaRuntime.getPendingUpdatePolicy();
       const lines = [];
+      lines.push(`Version: ${formatRuntimeVersion()}`);
+      lines.push(`Runtime: ${health.status}`);
       if (state.current) {
         lines.push(`Playback: now playing ${state.current.title}`);
       } else if (state.queue.length > 0) {
@@ -3622,6 +3725,19 @@ async function handleCommand(interaction) {
       }
 
       lines.push(state.recording ? "Recording: active" : "Recording: inactive");
+      lines.push(`Global idle: ${health.idle.global ? "yes" : "no"}`);
+      if (!health.idle.global) {
+        lines.push(`Idle blockers: ${health.idle.blockerSummary.join(", ")}`);
+      }
+      if (policy.pendingUpdate) {
+        lines.push(
+          `Pending update: ${policy.pendingUpdate.version} (${policy.pendingUpdate.severity}, ${policy.phase})` +
+            `${policy.pendingUpdate.forcedApplyDeadline ? `, deadline ${formatDateTime(policy.pendingUpdate.forcedApplyDeadline)}` : ""}`,
+        );
+        lines.push(`Long-lived actions: ${policy.canStartLongLivedActions ? "allowed" : "blocked"}`);
+      } else {
+        lines.push("Pending update: none");
+      }
       await interaction.reply({ content: lines.join("\n"), ephemeral: true });
       return;
     }
@@ -3631,8 +3747,12 @@ async function handleCommand(interaction) {
 }
 
 async function handlePlayerButton(interaction, guildId, action) {
+  await otaRuntime.syncPendingUpdateState();
   const state = getGuildState(guildId);
   await requireSameVoiceContext(interaction, state, { actionDescription: "use player controls" });
+  if (meaningfulPlayerActions.has(action)) {
+    otaRuntime.trackMeaningfulActivity(`player:${action}`);
+  }
   await interaction.deferUpdate();
 
   switch (action) {
@@ -3736,20 +3856,32 @@ client.on("guildCreate", async (guild) => {
 
 client.once("ready", async () => {
   logger.info(`Logged in as ${client.user.tag}`);
+  logger.info(`Runtime version: ${formatRuntimeVersion()}`);
   logger.info(`Runtime executable: node ${process.version}`);
+  logger.info(`Pending update state path: ${UPDATE_STATE_PATH}`);
+  logger.info(`Artifact manifest path: ${UPDATE_MANIFEST_PATH}`);
+  logger.info(`Supervisor contract: loopback-only${SUPERVISOR_TOKEN ? " with token auth" : " without token auth"}`);
 
   await configurePlayDl();
   await startDownloadServer();
+  await otaRuntime.syncPendingUpdateState();
   await syncCommands();
   await restorePlaybackSnapshot();
+  otaRuntime.setRuntimeReady();
   refreshPresence();
   startPresenceLoop();
   setInterval(() => {
     void pruneExpiredRecordings();
   }, CLEANUP_INTERVAL_SECONDS * 1000);
+  setInterval(() => {
+    void otaRuntime.syncPendingUpdateState().catch((error) => {
+      logger.warn(`Failed to refresh pending update state: ${error.message}`);
+    });
+  }, UPDATE_STATE_POLL_SECONDS * 1000);
 });
 
 client.on("error", (error) => {
+  otaRuntime.recordClientError(error);
   logger.error(`Client error: ${error.message}`);
 });
 

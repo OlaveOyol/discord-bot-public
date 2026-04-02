@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "version": "1.0.1",
+  "severity": "normal",
+  "releasedAt": "2026-04-03T00:00:00.000Z",
+  "applyAfterIdle": true,
+  "releaseNotesUrl": "https://example.invalid/releases/1.0.1",
+  "artifact": {
+    "path": "/var/lib/discord-bot/releases/discord-bot-1.0.1.tar.gz",
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "sizeBytes": 12345678
+  }
+}
