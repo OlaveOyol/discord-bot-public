@@ -349,8 +349,8 @@ function formatDuration(seconds) {
 }
 
 function trimRecordingIndicator(text) {
-  return String(text || "").endsWith(RECORDING_NICKNAME_INDICATOR)
-    ? String(text).slice(0, -RECORDING_NICKNAME_INDICATOR.length)
+  return String(text || "").startsWith(RECORDING_NICKNAME_INDICATOR)
+    ? String(text).slice(RECORDING_NICKNAME_INDICATOR.length)
     : String(text || "");
 }
 
@@ -358,7 +358,7 @@ function buildRecordingNickname(baseName) {
   const base = trimRecordingIndicator(baseName).trim();
   const source = base || client.user?.username || "Recorder";
   const maxBaseLength = Math.max(1, 32 - RECORDING_NICKNAME_INDICATOR.length);
-  return `${source.slice(0, maxBaseLength)}${RECORDING_NICKNAME_INDICATOR}`;
+  return `${RECORDING_NICKNAME_INDICATOR}${source.slice(0, maxBaseLength)}`;
 }
 
 function sanitizeFilename(value) {
@@ -2655,7 +2655,7 @@ async function refreshRecordingNickname(guildId) {
   }
 
   if (state.baseNickname === undefined) {
-    if (currentNickname && currentNickname.endsWith(RECORDING_NICKNAME_INDICATOR)) {
+    if (currentNickname && currentNickname.startsWith(RECORDING_NICKNAME_INDICATOR)) {
       state.baseNickname = trimRecordingIndicator(currentNickname);
     } else {
       return;
