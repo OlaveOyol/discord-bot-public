@@ -118,6 +118,11 @@ const WEB_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const AUDIO_FILE_EXTENSIONS = new Set([".wav", ".ogg", ".opus", ".mp3", ".m4a", ".aac"]);
 const ARCHIVE_AUDIO_EXTENSION = ".ogg";
 const ARCHIVE_AUDIO_BITRATE = env("ARCHIVE_AUDIO_BITRATE", "48k");
+const RECORDING_SILENCE_GRACE_MS = Math.max(250, Number.parseInt(env("RECORDING_SILENCE_GRACE_MS", "1000"), 10));
+const RECORDING_RESUBSCRIBE_DELAY_MS = Math.max(
+  100,
+  Number.parseInt(env("RECORDING_RESUBSCRIBE_DELAY_MS", "350"), 10),
+);
 
 let spotifyTokenCache = null;
 let downloadBaseUrl = DOWNLOAD_BASE_URL;
@@ -593,6 +598,7 @@ class RecordingSession {
     this.speakingListener = null;
     this.userStreams = new Map();
     this.fileWriters = new Map();
+    this.resubscribeTimers = new Map();
     fs.mkdirSync(this.directory, { recursive: true });
   }
 
@@ -642,10 +648,16 @@ class RecordingSession {
       return;
     }
 
+    const existingTimer = this.resubscribeTimers.get(userId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      this.resubscribeTimers.delete(userId);
+    }
+
     const opusStream = this.receiver.subscribe(userId, {
       end: {
         behavior: EndBehaviorType.AfterSilence,
-        duration: 250,
+        duration: RECORDING_SILENCE_GRACE_MS,
       },
     });
     const decoder = new prism.opus.Decoder({
@@ -655,7 +667,7 @@ class RecordingSession {
     });
     const writer = this.getWriter(guild, userId);
 
-    const destroyEntry = () => {
+    const destroyEntry = ({ resubscribe = false } = {}) => {
       const entry = this.userStreams.get(userId);
       if (!entry) {
         return;
@@ -666,15 +678,25 @@ class RecordingSession {
       entry.opusStream.destroy();
       entry.decoder.destroy();
       this.userStreams.delete(userId);
+
+      if (resubscribe && this.receiver) {
+        const timer = setTimeout(() => {
+          this.resubscribeTimers.delete(userId);
+          void this.subscribeUser(guild, userId).catch((error) => {
+            logger.warn(`Recording resubscribe error for user ${userId} in guild ${guild.id}: ${error.message}`);
+          });
+        }, RECORDING_RESUBSCRIBE_DELAY_MS);
+        this.resubscribeTimers.set(userId, timer);
+      }
     };
 
     opusStream.on("error", (error) => {
       logger.warn(`Recording stream error for user ${userId} in guild ${guild.id}: ${error.message}`);
-      destroyEntry();
+      destroyEntry({ resubscribe: true });
     });
     decoder.on("error", (error) => {
       logger.warn(`Recording decoder error for user ${userId} in guild ${guild.id}: ${error.message}`);
-      destroyEntry();
+      destroyEntry({ resubscribe: true });
     });
     decoder.on("data", (chunk) => writer.write(chunk));
     opusStream.once("end", () => destroyEntry());
@@ -694,6 +716,11 @@ class RecordingSession {
       decoder.destroy();
     }
     this.userStreams.clear();
+
+    for (const timer of this.resubscribeTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.resubscribeTimers.clear();
 
     for (const writer of this.fileWriters.values()) {
       await writer.close();
@@ -789,6 +816,7 @@ async function restoreRecordingSessionFromDirectory(directoryPath) {
   session.speakingListener = null;
   session.userStreams = new Map();
   session.fileWriters = new Map();
+  session.resubscribeTimers = new Map();
   return session;
 }
 
