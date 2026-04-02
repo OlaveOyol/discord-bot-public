@@ -54,7 +54,6 @@ This bot can:
 - `ARCHIVE_AUDIO_BITRATE` - ffmpeg bitrate used when older recordings are compressed for archives, default `48k`
 - `CLEANUP_INTERVAL_SECONDS` - expired-recording cleanup interval, default `3600`
 - `AFK_DISCONNECT_SECONDS` - idle timeout before leaving voice, default `300`
-- `RECORDING_SILENCE_GRACE_MS` - silence window before a speaker stream is closed, default `1000`
 - `RECORDING_RESUBSCRIBE_DELAY_MS` - delay before retrying a speaker stream after a bad packet/decode error, default `350`
 - `SPOTIFY_CLIENT_ID` - recommended for Spotify track, playlist, and album expansion
 - `SPOTIFY_CLIENT_SECRET` - recommended for Spotify track, playlist, and album expansion
@@ -105,6 +104,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 - if Discord OAuth is configured, `Home`, `Recent Sessions`, `Archives`, and `My Sessions` are all scoped to the signed-in Discord user
 - if Discord OAuth is configured, individual session pages, WAV files, and ZIP downloads are restricted to Discord users who were included in that session
 - the recorder now tolerates isolated decode failures by resubscribing the affected speaker stream instead of dropping that user for the rest of the recording
+- speaker subscriptions now stay open for the whole recording session, so a user can go silent and speak again without losing their stem
 
 ## Notes
 

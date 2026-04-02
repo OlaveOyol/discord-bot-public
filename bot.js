@@ -118,7 +118,6 @@ const WEB_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const AUDIO_FILE_EXTENSIONS = new Set([".wav", ".ogg", ".opus", ".mp3", ".m4a", ".aac"]);
 const ARCHIVE_AUDIO_EXTENSION = ".ogg";
 const ARCHIVE_AUDIO_BITRATE = env("ARCHIVE_AUDIO_BITRATE", "48k");
-const RECORDING_SILENCE_GRACE_MS = Math.max(250, Number.parseInt(env("RECORDING_SILENCE_GRACE_MS", "1000"), 10));
 const RECORDING_RESUBSCRIBE_DELAY_MS = Math.max(
   100,
   Number.parseInt(env("RECORDING_RESUBSCRIBE_DELAY_MS", "350"), 10),
@@ -696,8 +695,7 @@ class RecordingSession {
 
     const opusStream = this.receiver.subscribe(userId, {
       end: {
-        behavior: EndBehaviorType.AfterSilence,
-        duration: RECORDING_SILENCE_GRACE_MS,
+        behavior: EndBehaviorType.Manual,
       },
     });
     const decoder = new prism.opus.Decoder({
