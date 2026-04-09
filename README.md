@@ -49,6 +49,7 @@ This bot can:
 - `DOWNLOAD_BASE_URL` - public base URL for recording links, default `http://127.0.0.1:8765`
 - `DOWNLOAD_PORT_SEARCH_ATTEMPTS` - number of ports to try starting from `DOWNLOAD_PORT`, default `20`
 - `RECORDINGS_DIR` - recording output directory, default temp path
+- `SQLITE_DB_PATH` - optional SQLite metadata/persistence path, default inside `RECORDINGS_DIR`
 - `RECORDINGS_TTL_DAYS` - recording retention window in days, default `30`, capped at `31`
 - `RECENT_RECORDINGS_DAYS` - recent/archive split window in days, default `7`
 - `ARCHIVE_AUDIO_BITRATE` - ffmpeg bitrate used when older recordings are compressed for archives, default `48k`
@@ -56,6 +57,8 @@ This bot can:
 - `PLAYBACK_STATE_PATH` - optional path for persisted queue/current-track state across graceful restarts, default inside `RECORDINGS_DIR`
 - `CLEANUP_INTERVAL_SECONDS` - expired-recording cleanup interval, default `3600`
 - `AFK_DISCONNECT_SECONDS` - idle timeout before leaving voice, default `300`
+- `RADIO_MIN_BUFFER_TRACKS` - minimum upcoming tracks radio keeps queued, default `3`
+- `RADIO_RECENT_TRACKS_LIMIT` - recent-track dedupe window for radio, default `30`
 - `RECORDING_RESUBSCRIBE_DELAY_MS` - delay before retrying a speaker stream after a bad packet/decode error, default `350`
 - `SPOTIFY_CLIENT_ID` - recommended for Spotify track, playlist, and album expansion
 - `SPOTIFY_CLIENT_SECRET` - recommended for Spotify track, playlist, and album expansion
@@ -74,7 +77,11 @@ This bot can:
 - `/resume`
 - `/stop`
 - `/queue`
+- `/move from to`
 - `/shuffle`
+- `/radio start query`
+- `/radio stop`
+- `/radio status`
 - `/recordstart`
 - `/recordstop`
 - `/recordlink`
@@ -118,6 +125,8 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 - SoundCloud playback is enabled through `play-dl` and depends on its free client ID lookup succeeding at startup.
 - Commands are synced per guild on startup so they appear quickly in servers the bot is already in.
 - graceful restarts now persist the active voice channel, current track offset, queue, and pause state so OTA deploys can resume playback instead of clearing the queue
+- SQLite is used as a lightweight metadata/persistence layer for recordings, playback restart state, and radio state. Audio files and archives still remain on disk.
+- `/radio` uses YouTube search and YouTube related-video discovery for continuous refill. Spotify is still metadata/discovery only and is not used for native Spotify audio playback.
 - Discord voice receive is still not officially documented by Discord, but the Node voice stack here is the chosen path over the previous Python receive extension.
 - The website login uses Discord OAuth `identify` scope only. Session matching works by the Discord user IDs already embedded in per-user WAV filenames.
 - The recordings web UI now lives in `src/web/recordings-web.js` instead of being embedded directly inside the bot routes.
