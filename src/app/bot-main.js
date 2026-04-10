@@ -10,8 +10,10 @@ const { execFile, spawn } = require("node:child_process");
 const archiver = require("archiver");
 const dotenv = require("dotenv");
 const express = require("express");
+const { createSqliteStateStore } = require("../data/sqlite-state");
 const { registerOtaRoutes } = require("../ota/ota-routes");
 const { createOtaRuntime } = require("../ota/ota-runtime");
+const { createRadioRuntime } = require("../radio/radio-runtime");
 const play = require("play-dl");
 const prism = require("prism-media");
 const { formatRuntimeVersion, getRuntimeVersion } = require("../runtime/runtime-version");
@@ -27,6 +29,7 @@ const {
   ActivityType,
   ButtonBuilder,
   ButtonStyle,
+  ChannelType,
   Client,
   EmbedBuilder,
   GatewayIntentBits,
@@ -75,6 +78,7 @@ const DOWNLOAD_PORT_SEARCH_ATTEMPTS = Math.max(
   Number.parseInt(env("DOWNLOAD_PORT_SEARCH_ATTEMPTS", "20"), 10),
 );
 const RECORDINGS_DIR = env("RECORDINGS_DIR", path.join(os.tmpdir(), "discord-bot-recordings"));
+const SQLITE_DB_PATH = env("SQLITE_DB_PATH", path.join(RECORDINGS_DIR, "_state.sqlite"));
 const PLAYBACK_STATE_PATH = env("PLAYBACK_STATE_PATH", path.join(RECORDINGS_DIR, "_playback-state.json"));
 const UPDATE_STATE_PATH = env("UPDATE_STATE_PATH", path.join(RECORDINGS_DIR, "_update-state.json"));
 const UPDATE_MANIFEST_PATH = env("UPDATE_MANIFEST_PATH", path.join(RECORDINGS_DIR, "_staged-release-manifest.json"));
@@ -113,6 +117,14 @@ const PLAYLIST_MAX_TRACKS = Math.max(
   1,
   Number.parseInt(env("PLAYLIST_MAX_TRACKS", "200"), 10),
 );
+const RADIO_MIN_BUFFER_TRACKS = Math.max(
+  1,
+  Number.parseInt(env("RADIO_MIN_BUFFER_TRACKS", "3"), 10),
+);
+const RADIO_RECENT_TRACKS_LIMIT = Math.max(
+  10,
+  Number.parseInt(env("RADIO_RECENT_TRACKS_LIMIT", "30"), 10),
+);
 const SPOTIFY_CLIENT_ID = env("SPOTIFY_CLIENT_ID") || env("SPOTIPY_CLIENT_ID");
 const SPOTIFY_CLIENT_SECRET = env("SPOTIFY_CLIENT_SECRET") || env("SPOTIPY_CLIENT_SECRET");
 const DISCORD_CLIENT_ID = env("DISCORD_CLIENT_ID");
@@ -128,6 +140,11 @@ const logger = {
   warn: (...args) => console.warn(new Date().toISOString(), "WARN", "discord-bot -", ...args),
   error: (...args) => console.error(new Date().toISOString(), "ERROR", "discord-bot -", ...args),
 };
+
+const stateStore = createSqliteStateStore({
+  dbPath: SQLITE_DB_PATH,
+  logger,
+});
 
 const SPOTIFY_URL_RE = /^https?:\/\/open\.spotify\.com\/(track|album|playlist)\/([A-Za-z0-9]+)/i;
 const SPOTIFY_TITLE_RE = /<meta property="og:title" content="([^"]+)"/i;
@@ -169,6 +186,8 @@ let downloadBaseUrl = DOWNLOAD_BASE_URL;
 let downloadServer = null;
 let presenceCycleIndex = 0;
 let soundCloudReady = false;
+let playbackPersistTimer = null;
+let playbackPersistPromise = null;
 
 const guildStates = new Map();
 const completedRecordings = new Map();
@@ -198,6 +217,20 @@ const otaRuntime = createOtaRuntime({
   getUptimeSeconds: () => Math.floor(process.uptime()),
   savePlaybackSnapshot,
   finalizeActiveUpdateWork,
+});
+
+const radioRuntime = createRadioRuntime({
+  logger,
+  defaultMinBufferTracks: RADIO_MIN_BUFFER_TRACKS,
+  recentTracksLimit: RADIO_RECENT_TRACKS_LIMIT,
+  fetchCandidates: fetchRadioCandidates,
+  persistState: async (radioState) => {
+    stateStore.upsertRadioState(radioState);
+  },
+  clearPersistedState: (guildId) => {
+    stateStore.clearRadioState(guildId);
+  },
+  loadPersistedStates: () => stateStore.listActiveRadioStates(),
 });
 
 let instanceLockFd = null;
@@ -299,11 +332,17 @@ function trackFromSnapshot(track) {
   });
 }
 
-async function savePlaybackSnapshot() {
-  const guilds = [...guildStates.values()]
+function buildPlaybackSnapshots() {
+  return [...guildStates.values()]
     .map((state) => state.toPlaybackSnapshot())
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((snapshot) => ({
+      ...snapshot,
+      savedAt: new Date().toISOString(),
+    }));
+}
 
+async function writeLegacyPlaybackSnapshot(guilds) {
   if (guilds.length === 0) {
     await fsp.rm(PLAYBACK_STATE_PATH, { force: true }).catch(() => {});
     return;
@@ -317,15 +356,71 @@ async function savePlaybackSnapshot() {
   await fsp.writeFile(PLAYBACK_STATE_PATH, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
-async function restorePlaybackSnapshot() {
-  const payload = await fsp
+async function persistPlaybackSnapshots({ writeLegacy = false } = {}) {
+  const guilds = buildPlaybackSnapshots();
+  stateStore.replacePlaybackSnapshots(guilds);
+  if (writeLegacy) {
+    await writeLegacyPlaybackSnapshot(guilds);
+  } else if (guilds.length === 0) {
+    await fsp.rm(PLAYBACK_STATE_PATH, { force: true }).catch(() => {});
+  }
+}
+
+function schedulePlaybackSnapshotPersist() {
+  if (shuttingDown) {
+    return;
+  }
+
+  if (playbackPersistTimer) {
+    clearTimeout(playbackPersistTimer);
+  }
+
+  playbackPersistTimer = setTimeout(() => {
+    playbackPersistTimer = null;
+    playbackPersistPromise = persistPlaybackSnapshots().catch((error) => {
+      logger.warn(`Failed to persist playback state: ${error.message}`);
+    });
+  }, 500);
+}
+
+async function flushPendingPlaybackSnapshotPersist() {
+  if (playbackPersistTimer) {
+    clearTimeout(playbackPersistTimer);
+    playbackPersistTimer = null;
+    playbackPersistPromise = persistPlaybackSnapshots().catch((error) => {
+      logger.warn(`Failed to persist playback state: ${error.message}`);
+    });
+  }
+
+  await playbackPersistPromise;
+}
+
+async function savePlaybackSnapshot() {
+  await flushPendingPlaybackSnapshotPersist();
+  await persistPlaybackSnapshots({ writeLegacy: true });
+}
+
+async function readLegacyPlaybackSnapshot() {
+  return fsp
     .readFile(PLAYBACK_STATE_PATH, "utf8")
     .then((content) => JSON.parse(content))
     .catch(() => null);
+}
+
+async function restorePlaybackSnapshot() {
+  let payload = {
+    guilds: stateStore.loadPlaybackSnapshots(),
+  };
+
+  if (!Array.isArray(payload.guilds) || payload.guilds.length === 0) {
+    payload = await readLegacyPlaybackSnapshot();
+  }
+
   if (!payload || !Array.isArray(payload.guilds) || payload.guilds.length === 0) {
     return;
   }
 
+  stateStore.clearPlaybackSnapshots();
   await fsp.rm(PLAYBACK_STATE_PATH, { force: true }).catch(() => {});
 
   for (const guildSnapshot of payload.guilds) {
@@ -1068,6 +1163,7 @@ class RecordingSession {
       await createZipArchive(this.directory, this.archivePath, audioFiles);
     }
     await this.writeMetadata();
+    await syncRecordingSessionIndex(this);
   }
 
   async audioFiles({ extensions = null } = {}) {
@@ -1205,7 +1301,89 @@ async function restoreRecordingSessionFromDirectory(directoryPath) {
   return session;
 }
 
-async function loadStoredCompletedSessions() {
+function restoreRecordingSessionFromIndexRecord(record) {
+  if (!record?.token || !record.directoryPath) {
+    return null;
+  }
+
+  const session = Object.create(RecordingSession.prototype);
+  session.guildId = record.guildId;
+  session.channelId = record.channelId || null;
+  session.guildName = record.guildName || null;
+  session.channelName = record.channelName || null;
+  session.startedAt = record.startedAt ? new Date(record.startedAt) : new Date();
+  session.completedAt = record.completedAt ? new Date(record.completedAt) : null;
+  session.token = record.token;
+  session.directory = record.directoryPath;
+  session.archivePath = record.archivePath || null;
+  session.archived = Boolean(record.archived);
+  session.participantIds = normalizeDiscordUserIds(record.participantIds);
+  session.authorizedUserIds = normalizeDiscordUserIds(record.authorizedUserIds);
+  session.speakerUserIds = normalizeDiscordUserIds(record.speakerUserIds);
+  session.files = normalizeAudioFileNames(record.files);
+  session.fileEntries = Array.isArray(record.fileEntries)
+    ? record.fileEntries.map((fileEntry) => ({
+        fileName: String(fileEntry.fileName),
+        fileSizeBytes: Number.isFinite(fileEntry.fileSizeBytes) ? fileEntry.fileSizeBytes : 0,
+        modifiedAt: fileEntry.modifiedAt || null,
+      }))
+    : [];
+  session.receiver = null;
+  session.connection = null;
+  session.speakingListener = null;
+  session.startedHrTime = process.hrtime.bigint();
+  session.userStreams = new Map();
+  session.fileWriters = new Map();
+  session.resubscribeTimers = new Map();
+  return session;
+}
+
+async function collectRecordingFileEntries(session, fileNames = null) {
+  const names = normalizeAudioFileNames(fileNames || (await getSessionDownloadableAudioFiles(session)));
+  return Promise.all(
+    names.map(async (fileName) => {
+      const stat = await fsp.stat(path.join(session.directory, fileName)).catch(() => null);
+      return {
+        fileName,
+        fileSizeBytes: stat?.size || 0,
+        modifiedAt: stat?.mtime ? stat.mtime.toISOString() : null,
+      };
+    }),
+  );
+}
+
+async function buildRecordingIndexRecord(session) {
+  const files = await getSessionDownloadableAudioFiles(session);
+  const participantIds = await getSessionParticipantIds(session);
+  return {
+    token: session.token,
+    directoryPath: session.directory,
+    guildId: session.guildId,
+    guildName: session.guildName || null,
+    channelId: session.channelId || null,
+    channelName: session.channelName || null,
+    startedAt: session.startedAt,
+    completedAt: session.completedAt,
+    participantIds,
+    authorizedUserIds: normalizeDiscordUserIds(session.authorizedUserIds),
+    speakerUserIds: normalizeDiscordUserIds(session.speakerUserIds),
+    files,
+    archived: Boolean(session.archived),
+    archiveName: session.archivePath ? path.basename(session.archivePath) : null,
+    archivePath: session.archivePath || null,
+    retentionDays: RECORDINGS_TTL_DAYS,
+    expiresAt: session.expiresAt(),
+    sourceVersion: 2,
+    fileEntries: await collectRecordingFileEntries(session, files),
+    updatedAt: new Date(),
+  };
+}
+
+async function syncRecordingSessionIndex(session) {
+  stateStore.upsertRecordingSession(await buildRecordingIndexRecord(session));
+}
+
+async function rebuildRecordingIndexFromDisk({ logSummary = false } = {}) {
   const entries = await fsp.readdir(RECORDINGS_DIR, { withFileTypes: true }).catch(() => []);
   const sessions = [];
   for (const entry of entries) {
@@ -1219,7 +1397,21 @@ async function loadStoredCompletedSessions() {
     }
     sessions.push(session);
   }
+
+  const records = [];
+  for (const session of sessions) {
+    records.push(await buildRecordingIndexRecord(session));
+  }
+
+  stateStore.replaceRecordingSessions(records);
+  if (logSummary) {
+    logger.info(`Indexed ${records.length} recording session(s) into SQLite.`);
+  }
   return sessions;
+}
+
+async function loadStoredCompletedSessions() {
+  return stateStore.listRecordingSessions().map(restoreRecordingSessionFromIndexRecord).filter(Boolean);
 }
 
 async function resolveRecordingSession(token) {
@@ -1233,8 +1425,11 @@ async function resolveRecordingSession(token) {
     return inMemory;
   }
 
-  const storedSessions = await loadStoredCompletedSessions();
-  const stored = storedSessions.find((session) => session.token === token);
+  let stored = restoreRecordingSessionFromIndexRecord(stateStore.getRecordingSession(token));
+  if (!stored) {
+    await rebuildRecordingIndexFromDisk();
+    stored = restoreRecordingSessionFromIndexRecord(stateStore.getRecordingSession(token));
+  }
   if (stored) {
     completedRecordings.set(stored.token, stored);
     return stored;
@@ -1273,7 +1468,9 @@ async function findLatestCompletedRecordingForGuild(guildId) {
     }
   }
 
-  const latest = (await listRecordingSessions()).find((session) => session.guildId === guildId && session.completedAt) || null;
+  const latest = restoreRecordingSessionFromIndexRecord(stateStore.getLatestRecordingSessionForGuild(guildId))
+    || (await listRecordingSessions()).find((session) => session.guildId === guildId && session.completedAt)
+    || null;
   if (latest) {
     latestRecordingByGuild.set(guildId, latest.token);
   }
@@ -1282,8 +1479,15 @@ async function findLatestCompletedRecordingForGuild(guildId) {
 
 async function summarizeRecordingSession(session) {
   const audioFiles = await getSessionDownloadableAudioFiles(session);
+  const indexedFiles = Array.isArray(session.fileEntries)
+    ? new Map(session.fileEntries.map((fileEntry) => [fileEntry.fileName, fileEntry]))
+    : null;
   const audioStats = await Promise.all(
     audioFiles.map(async (name) => {
+      const indexed = indexedFiles?.get(name);
+      if (indexed) {
+        return { name, size: indexed.fileSizeBytes || 0 };
+      }
       const filePath = path.join(session.directory, name);
       const stat = await fsp.stat(filePath).catch(() => null);
       return { name, size: stat?.size || 0 };
@@ -1449,6 +1653,7 @@ async function archiveRecordingSessionIfNeeded(session, now = Date.now()) {
     session.archivePath = nextArchivePath;
     session.archived = true;
     await session.writeMetadata();
+    await syncRecordingSessionIndex(session);
   } catch (error) {
     logger.warn(`Failed to archive recording session ${session.token}: ${error.stderr?.trim() || error.message}`);
   }
@@ -1464,6 +1669,7 @@ class GuildState {
     this.playerMessageId = null;
     this.panelRefreshPromise = null;
     this.panelQueueVisible = false;
+    this.radio = null;
     this.recording = null;
     this.idleTimer = null;
     this.idleReason = null;
@@ -1598,6 +1804,8 @@ class GuildState {
     if (!this.deferPanelRefresh) {
       await refreshPlayerPanel(this.guildId);
     }
+    schedulePlaybackSnapshotPersist();
+    radioRuntime.scheduleRefill(this, "state_refresh");
     refreshPresence();
     void refreshVoiceLifecycle(this.guildId);
   }
@@ -1654,6 +1862,44 @@ class GuildState {
     return this.queue.length;
   }
 
+  async moveQueueItem(fromPosition, toPosition) {
+    if (this.queue.length === 0) {
+      return { moved: false, reason: "empty_queue" };
+    }
+
+    if (!Number.isInteger(fromPosition) || !Number.isInteger(toPosition)) {
+      throw new Error("Queue positions must be whole numbers.");
+    }
+
+    if (fromPosition < 1 || fromPosition > this.queue.length) {
+      throw new Error(`Track ${fromPosition} is not in the queue. Use \`/queue\` to see valid positions.`);
+    }
+
+    if (toPosition < 1 || toPosition > this.queue.length) {
+      throw new Error(`Target position must be between 1 and ${this.queue.length}.`);
+    }
+
+    if (fromPosition === toPosition) {
+      return {
+        moved: false,
+        reason: "same_position",
+        track: this.queue[fromPosition - 1] || null,
+        fromPosition,
+        toPosition,
+      };
+    }
+
+    const [track] = this.queue.splice(fromPosition - 1, 1);
+    this.queue.splice(toPosition - 1, 0, track);
+    await this.refreshState();
+    return {
+      moved: true,
+      track,
+      fromPosition,
+      toPosition,
+    };
+  }
+
   async playNext() {
     if (this.playingNext) {
       return;
@@ -1688,6 +1934,7 @@ class GuildState {
           if (stream && typeof play.attachListeners === "function") {
             play.attachListeners(this.player, stream);
           }
+          await radioRuntime.noteTrackStarted(this, nextTrack);
           break;
         } catch (error) {
           if ((nextTrack.resumeOffsetMs || 0) > 0) {
@@ -2229,23 +2476,93 @@ async function resolveSpotifySources(url, requestedBy) {
   return [];
 }
 
-async function resolveSearchTrack(query, requestedBy) {
+async function resolveSearchTracks(query, requestedBy, limit = 1) {
+  const safeLimit = Math.max(1, Math.min(10, limit));
   const results = await play.search(query, {
-    limit: 1,
+    limit: safeLimit,
     source: { youtube: "video" },
   });
-  const result = results[0];
+  return results.map((result) =>
+    createTrack({
+      title: result.title,
+      webpageUrl: result.url,
+      duration: result.durationInSec,
+      thumbnail: result.thumbnails?.at(-1)?.url || null,
+      requestedBy,
+    }),
+  );
+}
+
+async function resolveSearchTrack(query, requestedBy) {
+  const tracks = await resolveSearchTracks(query, requestedBy, 1);
+  const result = tracks[0];
   if (!result) {
     throw new Error("No playable results found for that query.");
   }
 
-  return createTrack({
-    title: result.title,
-    webpageUrl: result.url,
-    duration: result.durationInSec,
-    thumbnail: result.thumbnails?.at(-1)?.url || null,
-    requestedBy,
-  });
+  return result;
+}
+
+function buildRadioSearchQueries(seedQuery, basisTrack = null) {
+  const values = [
+    basisTrack?.searchQuery,
+    basisTrack?.title,
+    seedQuery,
+    seedQuery ? `${seedQuery} music` : null,
+    seedQuery ? `${seedQuery} mix` : null,
+    basisTrack?.title && seedQuery ? `${basisTrack.title} ${seedQuery}` : null,
+  ];
+  return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+async function resolveRadioSeedTrack(query, requestedBy) {
+  const tracks = await resolveSources(query, requestedBy);
+  const seedTrack = tracks[0];
+  if (!seedTrack) {
+    throw new Error("No playable seed track found for that radio query.");
+  }
+  return seedTrack;
+}
+
+async function resolveRadioRelatedTracks(track, requestedBy, limit = 5) {
+  const sourceUrl = track?.streamUrl || track?.webpageUrl || null;
+  if (!isYouTubeUrl(sourceUrl)) {
+    return [];
+  }
+
+  const info = await play.video_basic_info(sourceUrl);
+  const urls = Array.isArray(info.related_videos) ? info.related_videos : [];
+  const relatedTracks = [];
+  for (const url of urls) {
+    try {
+      const items = await resolveYouTubeSources(url, requestedBy);
+      if (items[0]) {
+        relatedTracks.push(items[0]);
+      }
+    } catch {}
+    if (relatedTracks.length >= limit) {
+      break;
+    }
+  }
+  return relatedTracks;
+}
+
+async function fetchRadioCandidates({ state, radioState, limit }) {
+  const basisTrack = state.current || state.history[0] || null;
+  const requestedBy = radioState.requestedBy || "radio";
+  const relatedTracks = basisTrack ? await resolveRadioRelatedTracks(basisTrack, requestedBy, limit) : [];
+  if (relatedTracks.length > 0) {
+    return relatedTracks;
+  }
+
+  const queries = buildRadioSearchQueries(radioState.seedQuery, basisTrack);
+  for (const query of queries) {
+    const items = await resolveSearchTracks(query, requestedBy, limit);
+    if (items.length > 0) {
+      return items;
+    }
+  }
+  return [];
 }
 
 async function resolveSoundCloudSources(url, requestedBy) {
@@ -2831,6 +3148,7 @@ async function disconnectGuild(guildId, reason) {
     }
     state.connection = null;
     await refreshRecordingNickname(guildId);
+    schedulePlaybackSnapshotPersist();
     refreshPresence();
     logger.info(`${reason} in guild ${guildId}`);
   } finally {
@@ -2935,6 +3253,13 @@ async function refreshVoiceLifecycle(guildId) {
   const channel = channelId ? guild.channels.cache.get(channelId) : null;
   const members = channel?.members ? [...channel.members.values()] : [];
   const nonBotMembers = members.filter((member) => !member.user.bot);
+  if (radioRuntime.shouldProtectChannel(state, channelId)) {
+    clearIdleTimer(state);
+    radioRuntime.scheduleRefill(state, "voice_lifecycle");
+    refreshPresence();
+    return;
+  }
+
   if (nonBotMembers.length === 0) {
     armIdleTimer(state, `Bot was alone in voice channel for ${AFK_DISCONNECT_SECONDS} seconds`);
     refreshPresence();
@@ -3024,6 +3349,7 @@ async function pruneExpiredRecordings() {
     if (latestRecordingByGuild.get(session.guildId) === session.token) {
       latestRecordingByGuild.delete(session.guildId);
     }
+    stateStore.removeRecordingSession(session.token);
     await fsp.rm(session.directory, { recursive: true, force: true }).catch(() => {});
   }
 }
@@ -3329,9 +3655,15 @@ async function startDownloadServer() {
     }
 
     const audioFiles = await getSessionDownloadableAudioFiles(session);
+    const indexedFiles = Array.isArray(session.fileEntries)
+      ? new Map(session.fileEntries.map((fileEntry) => [fileEntry.fileName, fileEntry]))
+      : null;
     const fileStats = await Promise.all(
       audioFiles.map(async (name) => {
-        const stat = await fsp.stat(path.join(session.directory, name)).catch(() => null);
+        const indexed = indexedFiles?.get(name);
+        const stat = indexed
+          ? { size: indexed.fileSizeBytes || 0 }
+          : await fsp.stat(path.join(session.directory, name)).catch(() => null);
         return {
           name,
           sizeLabel: formatBytes(stat?.size || 0),
@@ -3479,6 +3811,27 @@ async function requireSameVoiceContext(interaction, state, { actionDescription, 
   return member;
 }
 
+function resolveRequestedRadioChannel(member, requestedChannel) {
+  const memberChannel = member.voice?.channel || null;
+  if (!memberChannel?.isVoiceBased?.()) {
+    throw new Error("You must join a voice channel first.");
+  }
+
+  if (!requestedChannel) {
+    return memberChannel;
+  }
+
+  if (!requestedChannel.isVoiceBased?.()) {
+    throw new Error("Radio can only be bound to a voice channel.");
+  }
+
+  if (requestedChannel.id !== memberChannel.id) {
+    throw new Error(`Join <#${requestedChannel.id}> before binding radio there.`);
+  }
+
+  return requestedChannel;
+}
+
 const COMMANDS = [
   new SlashCommandBuilder().setName("ping").setDescription("Check if the bot is online"),
   new SlashCommandBuilder().setName("join").setDescription("Join your current voice channel"),
@@ -3496,10 +3849,44 @@ const COMMANDS = [
   new SlashCommandBuilder().setName("resume").setDescription("Resume playback"),
   new SlashCommandBuilder().setName("stop").setDescription("Stop playback and clear the queue"),
   new SlashCommandBuilder().setName("queue").setDescription("Show the current queue"),
+  new SlashCommandBuilder()
+    .setName("move")
+    .setDescription("Move a queued track to a different position")
+    .addIntegerOption((option) =>
+      option.setName("from").setDescription("Current 1-based queue position").setRequired(true).setMinValue(1),
+    )
+    .addIntegerOption((option) =>
+      option.setName("to").setDescription("New 1-based queue position").setRequired(true).setMinValue(1),
+    ),
   new SlashCommandBuilder().setName("shuffle").setDescription("Shuffle queued tracks"),
   new SlashCommandBuilder().setName("recordstart").setDescription("Start recording the current voice channel"),
   new SlashCommandBuilder().setName("recordstop").setDescription("Stop recording and return a download link"),
   new SlashCommandBuilder().setName("recordlink").setDescription("Get the download link for the latest recording"),
+  new SlashCommandBuilder()
+    .setName("radio")
+    .setDescription("Start or inspect continuous radio playback")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("start")
+        .setDescription("Start radio in a voice channel and keep it refilled")
+        .addStringOption((option) => option.setName("query").setDescription("Genre, vibe, or seed query").setRequired(true))
+        .addChannelOption((option) =>
+          option
+            .setName("channel")
+            .setDescription("Voice channel to bind radio to")
+            .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice),
+        ),
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("stop")
+        .setDescription("Stop radio and clear playback")
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("status")
+        .setDescription("Show radio status")
+    ),
   new SlashCommandBuilder().setName("status").setDescription("Show playback and recording status"),
 ].map((command) =>
   command
@@ -3513,6 +3900,35 @@ async function syncCommands() {
   }
   for (const guild of client.guilds.cache.values()) {
     await guild.commands.set(COMMANDS);
+  }
+}
+
+async function restorePersistedRadioStates() {
+  const persistedStates = radioRuntime.loadPersistedRadioStates();
+  for (const persisted of persistedStates) {
+    const guild = client.guilds.cache.get(persisted.guildId);
+    if (!guild) {
+      continue;
+    }
+
+    const channel = guild.channels.cache.get(persisted.boundChannelId)
+      || (await guild.channels.fetch(persisted.boundChannelId).catch(() => null));
+    if (!channel?.isVoiceBased?.()) {
+      logger.warn(`Skipping persisted radio in guild ${persisted.guildId}: bound channel is unavailable.`);
+      stateStore.clearRadioState(persisted.guildId);
+      continue;
+    }
+
+    const state = getGuildState(persisted.guildId);
+    state.controllerChannelId = persisted.controllerChannelId || state.controllerChannelId;
+    await radioRuntime.restore(state, persisted);
+    try {
+      await state.ensureConnectionToChannel(channel, { requireReceive: Boolean(state.recording) });
+      radioRuntime.scheduleRefill(state, "startup_restore");
+      logger.info(`Restored radio mode in guild ${persisted.guildId} for '${persisted.seedQuery}'.`);
+    } catch (error) {
+      logger.warn(`Failed to restore radio mode in guild ${persisted.guildId}: ${error.message}`);
+    }
   }
 }
 
@@ -3531,6 +3947,11 @@ async function handlePlay(interaction, { next = false } = {}) {
   await interaction.deferReply();
   state.controllerChannelId = interaction.channelId;
   await state.ensureConnection(member, { requireReceive: Boolean(state.recording) });
+
+  const radioWasActive = radioRuntime.isActive(state);
+  if (radioWasActive) {
+    await radioRuntime.stop(state);
+  }
 
   const query = interaction.options.getString("query", true);
   const requestedBy = interaction.member?.displayName || interaction.user.username;
@@ -3552,8 +3973,8 @@ async function handlePlay(interaction, { next = false } = {}) {
 
   const message =
     tracks.length === 1
-      ? `${next ? "Added next" : "Queued"}: ${tracks[0].title}`
-      : `${next ? "Queued next batch" : "Queued playlist"} with ${tracks.length} tracks${tracks.length >= PLAYLIST_MAX_TRACKS ? " (capped)" : ""}.`;
+      ? `${radioWasActive ? "Radio disabled. " : ""}${next ? "Added next" : "Queued"}: ${tracks[0].title}`
+      : `${radioWasActive ? "Radio disabled. " : ""}${next ? "Queued next batch" : "Queued playlist"} with ${tracks.length} tracks${tracks.length >= PLAYLIST_MAX_TRACKS ? " (capped)" : ""}.`;
   await safeReply(interaction, message);
   await refreshPlayerPanel(guild.id, { repost: true });
   refreshPresence();
@@ -3584,6 +4005,9 @@ async function handleCommand(interaction) {
       await requireSameVoiceContext(interaction, state, { actionDescription: "make the bot leave voice" });
       otaRuntime.trackMeaningfulActivity("leave command");
       await interaction.deferReply({ ephemeral: true });
+      if (radioRuntime.isActive(state)) {
+        await radioRuntime.stop(state);
+      }
       await disconnectGuild(guildId, "Manual leave requested");
       await safeReply(interaction, "Disconnected from voice and cleared playback state.", { ephemeral: true });
       return;
@@ -3617,6 +4041,9 @@ async function handleCommand(interaction) {
     case "stop":
       await requireSameVoiceContext(interaction, state, { actionDescription: "stop playback" });
       otaRuntime.trackMeaningfulActivity("stop command");
+      if (radioRuntime.isActive(state)) {
+        await radioRuntime.stop(state);
+      }
       await state.stopPlayback();
       await interaction.reply({ content: "Stopped.", ephemeral: true });
       return;
@@ -3627,6 +4054,20 @@ async function handleCommand(interaction) {
         components: buildQueueComponents(guildId, page, totalPages),
         ephemeral: true,
       });
+      return;
+    }
+    case "move": {
+      await requireSameVoiceContext(interaction, state, { actionDescription: "reorder the queue" });
+      otaRuntime.trackMeaningfulActivity("move command");
+      const fromPosition = interaction.options.getInteger("from", true);
+      const toPosition = interaction.options.getInteger("to", true);
+      const result = await state.moveQueueItem(fromPosition, toPosition);
+      const content = !result.moved
+        ? result.reason === "empty_queue"
+          ? "Queue is empty."
+          : `Track ${fromPosition} is already at position ${toPosition}.`
+        : `Moved \`${truncate(result.track?.title || "track", 80)}\` from ${fromPosition} to ${toPosition}.`;
+      await interaction.reply({ content, ephemeral: true });
       return;
     }
     case "shuffle": {
@@ -3702,6 +4143,79 @@ async function handleCommand(interaction) {
       );
       return;
     }
+    case "radio": {
+      const subcommand = interaction.options.getSubcommand(true);
+      if (subcommand === "status") {
+        const radioStatus = radioRuntime.getStatus(state);
+        const lines = radioStatus.active
+          ? [
+              "Radio: active",
+              `Bound channel: <#${radioStatus.boundChannelId}>`,
+              `Seed: ${radioStatus.seedQuery}`,
+              `Source mode: ${radioStatus.sourceMode}`,
+              `Buffered upcoming: ${radioStatus.bufferedUpcomingCount}`,
+              `Min buffer: ${radioStatus.minBufferTracks}`,
+              `Last error: ${radioStatus.lastError || "none"}`,
+            ]
+          : ["Radio: inactive"];
+        await interaction.reply({ content: lines.join("\n"), ephemeral: true });
+        return;
+      }
+
+      if (subcommand === "stop") {
+        await requireSameVoiceContext(interaction, state, { actionDescription: "stop radio" });
+        otaRuntime.trackMeaningfulActivity("radio stop command");
+        const wasActive = radioRuntime.isActive(state);
+        await radioRuntime.stop(state);
+        await state.stopPlayback();
+        await interaction.reply({
+          content: wasActive ? "Radio stopped and playback cleared." : "Radio was already inactive.",
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (subcommand === "start") {
+        const member = await requireSameVoiceContext(interaction, state, {
+          actionDescription: "start radio",
+          requireVoiceWhenDisconnected: true,
+        });
+        otaRuntime.trackMeaningfulActivity("radio start command");
+        await interaction.deferReply({ ephemeral: true });
+        const targetChannel = resolveRequestedRadioChannel(
+          member,
+          interaction.options.getChannel("channel", false),
+        );
+        const query = interaction.options.getString("query", true);
+        const requestedBy = interaction.member?.displayName || interaction.user.username;
+        const seedTrack = await resolveRadioSeedTrack(query, requestedBy);
+
+        state.controllerChannelId = interaction.channelId;
+        await state.ensureConnectionToChannel(targetChannel, { requireReceive: Boolean(state.recording) });
+        if (radioRuntime.isActive(state)) {
+          await radioRuntime.stop(state);
+        }
+        await state.stopPlayback();
+        await radioRuntime.start(state, {
+          boundChannelId: targetChannel.id,
+          controllerChannelId: interaction.channelId,
+          seedQuery: query,
+          requestedBy,
+          sourceMode: "youtube-related+search",
+        });
+        await state.enqueue([seedTrack]);
+        await radioRuntime.ensureRefill(state, "radio_start");
+        await safeReply(
+          interaction,
+          `Radio started in <#${targetChannel.id}> with seed \`${truncate(query, 100)}\`.`,
+          { ephemeral: true },
+        );
+        await refreshPlayerPanel(guildId, { repost: true });
+        return;
+      }
+
+      throw new Error("Unsupported radio subcommand.");
+    }
     case "status": {
       const health = otaRuntime.buildHealthSnapshot();
       const policy = otaRuntime.getPendingUpdatePolicy();
@@ -3738,6 +4252,13 @@ async function handleCommand(interaction) {
       } else {
         lines.push("Pending update: none");
       }
+      const radioStatus = radioRuntime.getStatus(state);
+      lines.push(`Radio: ${radioStatus.active ? `active in <#${radioStatus.boundChannelId}>` : "inactive"}`);
+      if (radioStatus.active) {
+        lines.push(`Radio seed: ${radioStatus.seedQuery}`);
+        lines.push(`Radio source: ${radioStatus.sourceMode}`);
+        lines.push(`Radio buffered upcoming: ${radioStatus.bufferedUpcomingCount}`);
+      }
       await interaction.reply({ content: lines.join("\n"), ephemeral: true });
       return;
     }
@@ -3770,6 +4291,9 @@ async function handlePlayerButton(interaction, guildId, action) {
       await state.skip();
       return;
     case "stop":
+      if (radioRuntime.isActive(state)) {
+        await radioRuntime.stop(state);
+      }
       await state.stopPlayback();
       return;
     case "shuffle":
@@ -3860,13 +4384,16 @@ client.once("ready", async () => {
   logger.info(`Runtime executable: node ${process.version}`);
   logger.info(`Pending update state path: ${UPDATE_STATE_PATH}`);
   logger.info(`Artifact manifest path: ${UPDATE_MANIFEST_PATH}`);
+  logger.info(`SQLite state path: ${SQLITE_DB_PATH}`);
   logger.info(`Supervisor contract: loopback-only${SUPERVISOR_TOKEN ? " with token auth" : " without token auth"}`);
 
   await configurePlayDl();
   await startDownloadServer();
   await otaRuntime.syncPendingUpdateState();
+  await rebuildRecordingIndexFromDisk({ logSummary: true });
   await syncCommands();
   await restorePlaybackSnapshot();
+  await restorePersistedRadioStates();
   otaRuntime.setRuntimeReady();
   refreshPresence();
   startPresenceLoop();
@@ -3903,6 +4430,8 @@ async function shutdown(signal = "unknown") {
     downloadServer.close();
   }
 
+  await flushPendingPlaybackSnapshotPersist();
+
   for (const state of guildStates.values()) {
     if (state.recording) {
       const session = state.recording;
@@ -3916,6 +4445,7 @@ async function shutdown(signal = "unknown") {
   }
 
   await client.destroy().catch(() => {});
+  stateStore.close();
   releaseInstanceLock();
   process.exit(0);
 }

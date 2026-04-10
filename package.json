@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node bot.js",
-    "check": "node --check bot.js && node --check src/app/bot-main.js && node --check src/ota/ota-runtime.js && node --check src/ota/ota-routes.js && node --check src/runtime/runtime-health.js && node --check src/runtime/runtime-version.js && node --check src/web/recordings-web.js",
+    "check": "node --check bot.js && node --check src/app/bot-main.js && node --check src/data/sqlite-state.js && node --check src/ota/ota-runtime.js && node --check src/ota/ota-routes.js && node --check src/radio/radio-runtime.js && node --check src/runtime/runtime-health.js && node --check src/runtime/runtime-version.js && node --check src/web/recordings-web.js",
     "package:release": "node deploy/scripts/package-release.js",
     "ota:apply": "node deploy/scripts/ota-supervisor.js apply"
   },
