@@ -62,6 +62,7 @@ This bot can:
 - `RECORDING_RESUBSCRIBE_DELAY_MS` - delay before retrying a speaker stream after a bad packet/decode error, default `350`
 - `SPOTIFY_CLIENT_ID` - recommended for Spotify track, playlist, and album expansion
 - `SPOTIFY_CLIENT_SECRET` - recommended for Spotify track, playlist, and album expansion
+- `SPOTIFY_MARKET` - market code used for Spotify metadata lookups when no user token is available, default `US`
 - `PLAYLIST_MAX_TRACKS` - max tracks imported from one playlist or album, default `200`
 - `SUPERVISOR_TOKEN` - optional bearer token required by the local-only `/internal/ota/*` supervisor endpoints
 

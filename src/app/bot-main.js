@@ -117,6 +117,8 @@ const PLAYLIST_MAX_TRACKS = Math.max(
   1,
   Number.parseInt(env("PLAYLIST_MAX_TRACKS", "200"), 10),
 );
+const SPOTIFY_MARKET = env("SPOTIFY_MARKET", "US")?.toUpperCase();
+const SPOTIFY_PLAYLIST_PAGE_SIZE = 50;
 const RADIO_MIN_BUFFER_TRACKS = Math.max(
   1,
   Number.parseInt(env("RADIO_MIN_BUFFER_TRACKS", "3"), 10),
@@ -2175,7 +2177,7 @@ async function spotifyApiGet(pathname) {
     throw new Error("Spotify credentials are not configured.");
   }
 
-  const response = await fetch(`https://api.spotify.com/v1/${pathname}`, {
+  const response = await fetch(spotifyApiUrl(pathname), {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!response.ok) {
@@ -2201,6 +2203,118 @@ async function spotifyPublicToken() {
 
   const payload = await response.json();
   return payload.accessToken || null;
+}
+
+function spotifyApiUrl(pathnameOrUrl, params = {}) {
+  const url = pathnameOrUrl.startsWith("http")
+    ? new URL(pathnameOrUrl)
+    : new URL(`https://api.spotify.com/v1/${pathnameOrUrl}`);
+
+  if (SPOTIFY_MARKET && !url.searchParams.has("market")) {
+    url.searchParams.set("market", SPOTIFY_MARKET);
+  }
+
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || url.searchParams.has(key)) {
+      continue;
+    }
+    url.searchParams.set(key, String(value));
+  }
+
+  return url;
+}
+
+function spotifyPlaylistLooksComplete(itemCount, expectedTotal) {
+  if (!Number.isInteger(expectedTotal)) {
+    return itemCount > 0;
+  }
+  return itemCount >= Math.min(expectedTotal, PLAYLIST_MAX_TRACKS);
+}
+
+function spotifyPlaylistTotalFromHtmlState(state, spotifyId) {
+  const itemsByUri = state?.entities?.items || {};
+  const playlistUri = `spotify:playlist:${spotifyId}`;
+  const playlist =
+    itemsByUri[playlistUri] || Object.entries(itemsByUri).find(([key]) => key.startsWith(playlistUri))?.[1];
+  if (!playlist || typeof playlist !== "object") {
+    return null;
+  }
+
+  const candidates = [
+    playlist?.content?.totalCount,
+    playlist?.content?.total,
+    playlist?.tracks?.totalCount,
+    playlist?.tracks?.total,
+    playlist?.trackCount,
+    playlist?.length,
+  ];
+  for (const candidate of candidates) {
+    if (Number.isInteger(candidate) && candidate >= 0) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function spotifyPlaylistTracksWithToken(spotifyId, requestedBy, getToken) {
+  const items = [];
+  let offset = 0;
+  let expectedTotal = null;
+
+  while (items.length < PLAYLIST_MAX_TRACKS) {
+    const limit = Math.min(SPOTIFY_PLAYLIST_PAGE_SIZE, PLAYLIST_MAX_TRACKS - items.length);
+    const token = await getToken();
+    if (!token) {
+      break;
+    }
+
+    const response = await fetch(
+      spotifyApiUrl(`playlists/${spotifyId}/tracks`, {
+        limit,
+        offset,
+        additional_types: "track",
+      }),
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          "User-Agent": "Mozilla/5.0",
+        },
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Spotify playlist request failed with status ${response.status}`);
+    }
+
+    const payload = await response.json();
+    if (Number.isInteger(payload.total)) {
+      expectedTotal = payload.total;
+    }
+
+    const rows = payload.items || [];
+    for (const row of rows) {
+      const item = queueTrackFromSpotifyApi(row.track, requestedBy);
+      if (item) {
+        items.push(item);
+      }
+      if (items.length >= PLAYLIST_MAX_TRACKS) {
+        break;
+      }
+    }
+
+    offset += rows.length;
+    if (rows.length === 0) {
+      break;
+    }
+    if (Number.isInteger(expectedTotal) && offset >= expectedTotal) {
+      break;
+    }
+    if (!payload.next && !Number.isInteger(expectedTotal)) {
+      break;
+    }
+  }
+
+  return { items, expectedTotal };
 }
 
 function queueTrackFromSpotifyApi(track, requestedBy) {
@@ -2290,48 +2404,22 @@ function queueTrackFromSpotifyHtml(track, requestedBy) {
 }
 
 async function spotifyFallbackPlaylistTracks(spotifyId, requestedBy) {
-  const token = await spotifyPublicToken();
-  if (token) {
-    const items = [];
-    let offset = 0;
-    while (items.length < PLAYLIST_MAX_TRACKS) {
-      const limit = Math.min(100, PLAYLIST_MAX_TRACKS - items.length);
-      const url = new URL(`https://api.spotify.com/v1/playlists/${spotifyId}/tracks`);
-      url.searchParams.set("limit", String(limit));
-      url.searchParams.set("offset", String(offset));
-      url.searchParams.set("additional_types", "track");
-
-      const response = await fetch(url, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/json",
-          "User-Agent": "Mozilla/5.0",
-        },
-      });
-      if (!response.ok) {
-        break;
-      }
-
-      const payload = await response.json();
-      const rows = payload.items || [];
-      for (const row of rows) {
-        const item = queueTrackFromSpotifyApi(row.track, requestedBy);
-        if (item) {
-          items.push(item);
-        }
-        if (items.length >= PLAYLIST_MAX_TRACKS) {
-          break;
-        }
-      }
-
-      if (!payload.next || rows.length === 0) {
-        break;
-      }
-      offset += rows.length;
-    }
-    if (items.length > 0) {
+  try {
+    const { items, expectedTotal } = await spotifyPlaylistTracksWithToken(
+      spotifyId,
+      requestedBy,
+      spotifyPublicToken,
+    );
+    if (spotifyPlaylistLooksComplete(items.length, expectedTotal)) {
       return items;
     }
+    if (items.length > 0) {
+      logger.warn(
+        `Spotify public playlist fallback was partial for ${spotifyId}: resolved ${items.length} of ${expectedTotal}.`,
+      );
+    }
+  } catch (error) {
+    logger.warn(`Spotify public playlist fallback failed: ${error.message}`);
   }
 
   const response = await fetch(`https://open.spotify.com/playlist/${spotifyId}`, {
@@ -2351,6 +2439,7 @@ async function spotifyFallbackPlaylistTracks(spotifyId, requestedBy) {
   }
 
   const tracks = spotifyPlaylistItemsFromHtmlState(state, spotifyId);
+  const expectedTotal = spotifyPlaylistTotalFromHtmlState(state, spotifyId);
   const items = [];
   for (const track of tracks) {
     const item = queueTrackFromSpotifyHtml(track, requestedBy);
@@ -2360,6 +2449,11 @@ async function spotifyFallbackPlaylistTracks(spotifyId, requestedBy) {
     if (items.length >= PLAYLIST_MAX_TRACKS) {
       break;
     }
+  }
+  if (items.length > 0 && !spotifyPlaylistLooksComplete(items.length, expectedTotal)) {
+    throw new Error(
+      `Spotify playlist expansion only resolved ${items.length} of ${expectedTotal} tracks. Check SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET and SPOTIFY_MARKET.`,
+    );
   }
   return items;
 }
@@ -2411,35 +2505,18 @@ async function resolveSpotifySources(url, requestedBy) {
   if (kind === "playlist") {
     if (SPOTIFY_CLIENT_ID && SPOTIFY_CLIENT_SECRET) {
       try {
-        let page = await spotifyApiGet(
-          `playlists/${spotifyId}/tracks?limit=${Math.min(100, PLAYLIST_MAX_TRACKS)}&additional_types=track`,
+        const { items, expectedTotal } = await spotifyPlaylistTracksWithToken(
+          spotifyId,
+          requestedBy,
+          spotifyAccessToken,
         );
-        const items = [];
-        while (page && items.length < PLAYLIST_MAX_TRACKS) {
-          for (const row of page.items || []) {
-            const item = queueTrackFromSpotifyApi(row.track, requestedBy);
-            if (item) {
-              items.push(item);
-            }
-            if (items.length >= PLAYLIST_MAX_TRACKS) {
-              break;
-            }
-          }
-
-          if (items.length >= PLAYLIST_MAX_TRACKS || !page.next) {
-            break;
-          }
-
-          const response = await fetch(page.next, {
-            headers: { Authorization: `Bearer ${await spotifyAccessToken()}` },
-          });
-          if (!response.ok) {
-            break;
-          }
-          page = await response.json();
+        if (spotifyPlaylistLooksComplete(items.length, expectedTotal)) {
+          return items;
         }
         if (items.length > 0) {
-          return items;
+          logger.warn(
+            `Spotify playlist API lookup was partial for ${spotifyId}: resolved ${items.length} of ${expectedTotal}.`,
+          );
         }
       } catch (error) {
         logger.warn(`Spotify playlist API lookup failed, trying fallback: ${error.message}`);
