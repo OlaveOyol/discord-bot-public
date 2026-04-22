@@ -76,4 +76,4 @@ jobs:
           service_name="${DEPLOY_SERVICE_NAME:-discord-bot}"
           port="${DEPLOY_PORT:-22}"
           ssh -p "$port" "${DEPLOY_USER}@${DEPLOY_HOST}" \
-            "sudo git config --global --add safe.directory '$app_dir' && sudo APP_DIR='$app_dir' SERVICE_NAME='$service_name' BRANCH='${GITHUB_REF_NAME}' bash '$app_dir/deploy/scripts/deploy.sh'"
+            "sudo git config --global --add safe.directory '$app_dir' && sudo APP_DIR='$app_dir' SERVICE_NAME='$service_name' BRANCH='${GITHUB_REF_NAME}' REVISION='${GITHUB_SHA}' bash '$app_dir/deploy/scripts/deploy.sh'"

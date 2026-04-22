@@ -6,10 +6,22 @@ APP_USER="${APP_USER:-discordbot}"
 APP_GROUP="${APP_GROUP:-$APP_USER}"
 SERVICE_NAME="${SERVICE_NAME:-discord-bot}"
 BRANCH="${BRANCH:-main}"
+REVISION="${REVISION:-}"
 REPO_URL="${REPO_URL:-}"
 RECORDINGS_DIR="${RECORDINGS_DIR:-/var/lib/discord-bot/recordings}"
 SHARED_DIR="${SHARED_DIR:-$APP_DIR/shared}"
 LOCK_FILE="${LOCK_FILE:-/tmp/discord-bot-deploy.lock}"
+BUILD_ROOT="${BUILD_ROOT:-/tmp}"
+BUILD_WORKTREE=""
+
+cleanup() {
+  if [ -n "$BUILD_WORKTREE" ] && [ -d "$BUILD_WORKTREE" ]; then
+    git -C "$APP_DIR" worktree remove --force "$BUILD_WORKTREE" >/dev/null 2>&1 || true
+    rm -rf "$BUILD_WORKTREE" >/dev/null 2>&1 || true
+  fi
+}
+
+trap cleanup EXIT
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -81,14 +93,23 @@ fi
 git config --global --add safe.directory "$APP_DIR"
 git -C "$APP_DIR" fetch --prune origin
 git -C "$APP_DIR" checkout "$BRANCH"
-git -C "$APP_DIR" reset --hard "origin/$BRANCH"
+target_ref="origin/$BRANCH"
+if [ -n "$REVISION" ]; then
+  git -C "$APP_DIR" cat-file -e "${REVISION}^{commit}"
+  target_ref="$REVISION"
+fi
+git -C "$APP_DIR" reset --hard "$target_ref"
 
-cd "$APP_DIR"
+BUILD_WORKTREE="$(mktemp -d "$BUILD_ROOT/discord-bot-build.XXXXXX")"
+git config --global --add safe.directory "$BUILD_WORKTREE"
+git -C "$APP_DIR" worktree add --force --detach "$BUILD_WORKTREE" "$target_ref"
+
+cd "$BUILD_WORKTREE"
 npm ci --omit=dev
 npm run check
 
-if [ -f "$APP_DIR/deploy/systemd/discord-bot.service" ]; then
-  install -m 0644 "$APP_DIR/deploy/systemd/discord-bot.service" "/etc/systemd/system/${SERVICE_NAME}.service"
+if [ -f "$BUILD_WORKTREE/deploy/systemd/discord-bot.service" ]; then
+  install -m 0644 "$BUILD_WORKTREE/deploy/systemd/discord-bot.service" "/etc/systemd/system/${SERVICE_NAME}.service"
   systemctl daemon-reload
   systemctl enable "$SERVICE_NAME" >/dev/null
 fi
@@ -106,8 +127,8 @@ if [ ! -f "$SHARED_DIR/.env" ]; then
   echo "Warning: $SHARED_DIR/.env does not exist yet." >&2
 fi
 
-build_id="$(git -C "$APP_DIR" rev-parse --short=12 HEAD)"
-package_result="$(node "$APP_DIR/deploy/scripts/package-release.js" --build-id "$build_id" --output-dir "$APP_DIR/staging/artifacts")"
+build_id="$(git -C "$BUILD_WORKTREE" rev-parse --short=12 HEAD)"
+package_result="$(node "$BUILD_WORKTREE/deploy/scripts/package-release.js" --build-id "$build_id" --output-dir "$APP_DIR/staging/artifacts")"
 manifest_path="$(printf '%s' "$package_result" | node -e "const fs=require('node:fs'); const data=JSON.parse(fs.readFileSync(0,'utf8')); process.stdout.write(data.manifestPath);")"
 supervisor_token=""
 if [ -f "$SHARED_DIR/.env" ]; then
