@@ -193,6 +193,7 @@ const RUNTIME_VERSION = getRuntimeVersion();
 
 let spotifyTokenCache = null;
 let spotifyUserTokenCache = null;
+let spotifyPublicTokenCache = null;
 let downloadBaseUrl = DOWNLOAD_BASE_URL;
 let downloadServer = null;
 let presenceCycleIndex = 0;
@@ -2318,21 +2319,34 @@ async function spotifyApiGet(pathname) {
 }
 
 async function spotifyPublicToken() {
-  const response = await fetch(
-    "https://open.spotify.com/get_access_token?reason=transport&productType=web_player",
-    {
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        Accept: "application/json",
-      },
+  if (spotifyPublicTokenCache && spotifyPublicTokenCache.expiresAt > Date.now() + 30_000) {
+    return spotifyPublicTokenCache.token;
+  }
+
+  const response = await fetch("https://open.spotify.com/embed/api/token", {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      Accept: "application/json",
+      "Accept-Language": "en-US,en;q=0.9",
+      Referer: "https://open.spotify.com/embed/playlist/",
     },
-  );
+  });
   if (!response.ok) {
     return null;
   }
 
   const payload = await response.json();
-  return payload.accessToken || null;
+  if (!payload?.accessToken) {
+    return null;
+  }
+
+  spotifyPublicTokenCache = {
+    token: payload.accessToken,
+    expiresAt: Number.isFinite(payload.accessTokenExpirationTimestampMs)
+      ? payload.accessTokenExpirationTimestampMs
+      : Date.now() + 5 * 60 * 1000,
+  };
+  return spotifyPublicTokenCache.token;
 }
 
 function spotifyApiUrl(pathnameOrUrl, params = {}) {
