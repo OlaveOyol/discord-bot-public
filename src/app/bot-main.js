@@ -115,7 +115,7 @@ const SUPERVISOR_PREPARE_TIMEOUT_SECONDS = Math.max(
 );
 const PLAYLIST_MAX_TRACKS = Math.max(
   1,
-  Number.parseInt(env("PLAYLIST_MAX_TRACKS", "200"), 10),
+  Number.parseInt(env("PLAYLIST_MAX_TRACKS", "500"), 10),
 );
 const SPOTIFY_MARKET = env("SPOTIFY_MARKET", "US")?.toUpperCase();
 const SPOTIFY_PLAYLIST_PAGE_SIZE = 50;
@@ -157,6 +157,7 @@ const SPOTIFY_TITLE_RE = /<meta property="og:title" content="([^"]+)"/i;
 const SPOTIFY_DESC_RE = /<meta property="og:description" content="([^"]+)"/i;
 const SPOTIFY_INITIAL_STATE_RE = /<script id="initialState" type="text\/plain">(.*?)<\/script>/is;
 const SPOTIFY_OAUTH_SCOPES = "playlist-read-private playlist-read-collaborative";
+const SPOTIFY_PARTNER_PLAYLIST_QUERY_HASH = "6f7fef1ef9760ba77aeb68d8153d458eeec2dce3430cef02b5f094a8ef9a465d";
 const RECORDINGS_TTL_MS = RECORDINGS_TTL_DAYS * 24 * 60 * 60 * 1000;
 const RECENT_RECORDINGS_MS = RECENT_RECORDINGS_DAYS * 24 * 60 * 60 * 1000;
 const LOCAL_YTDLP_PATH = path.join(BOT_DIR, ".venv", "Scripts", "yt-dlp.exe");
@@ -2352,11 +2353,38 @@ function spotifyApiUrl(pathnameOrUrl, params = {}) {
   return url;
 }
 
+function spotifyPartnerPlaylistUrl(spotifyId, offset = 0, limit = 100) {
+  const url = new URL("https://api-partner.spotify.com/pathfinder/v1/query");
+  url.searchParams.set("operationName", "fetchPlaylistMetadata");
+  url.searchParams.set(
+    "variables",
+    JSON.stringify({
+      uri: `spotify:playlist:${spotifyId}`,
+      offset,
+      limit,
+    }),
+  );
+  url.searchParams.set(
+    "extensions",
+    JSON.stringify({
+      persistedQuery: {
+        version: 1,
+        sha256Hash: SPOTIFY_PARTNER_PLAYLIST_QUERY_HASH,
+      },
+    }),
+  );
+  return url;
+}
+
 function spotifyPlaylistLooksComplete(itemCount, expectedTotal) {
   if (!Number.isInteger(expectedTotal)) {
     return itemCount > 0;
   }
   return itemCount >= Math.min(expectedTotal, PLAYLIST_MAX_TRACKS);
+}
+
+function spotifyTrackFromContentRow(row) {
+  return row?.itemV2?.data || row?.item?.data || row?.item || row?.track || null;
 }
 
 function spotifyPlaylistTotalFromHtmlState(state, spotifyId) {
@@ -2494,7 +2522,7 @@ function spotifyPlaylistItemsFromHtmlState(state, spotifyId) {
   const contentItems = playlist?.content?.items || [];
   const tracks = [];
   for (const row of contentItems) {
-    const track = row?.itemV2?.data || row?.item || row?.track;
+    const track = spotifyTrackFromContentRow(row);
     if (!track || typeof track !== "object") {
       continue;
     }
@@ -2507,6 +2535,61 @@ function spotifyPlaylistItemsFromHtmlState(state, spotifyId) {
     tracks.push(track);
   }
   return tracks;
+}
+
+async function spotifyPartnerPlaylistTracks(spotifyId, requestedBy, getToken) {
+  const items = [];
+  let offset = 0;
+  let expectedTotal = null;
+  let pageLimit = 100;
+
+  while (items.length < PLAYLIST_MAX_TRACKS) {
+    const token = await getToken();
+    if (!token) {
+      break;
+    }
+
+    const remaining = PLAYLIST_MAX_TRACKS - items.length;
+    const limit = Math.max(1, Math.min(pageLimit, remaining));
+    const response = await fetch(spotifyPartnerPlaylistUrl(spotifyId, offset, limit), {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Spotify public playlist metadata request failed with status ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const content = payload?.data?.playlistV2?.content || null;
+    if (Number.isInteger(content?.totalCount)) {
+      expectedTotal = content.totalCount;
+    }
+
+    const rows = Array.isArray(content?.items) ? content.items : [];
+    for (const row of rows) {
+      const track = spotifyTrackFromContentRow(row);
+      const item = queueTrackFromSpotifyHtml(track, requestedBy);
+      if (item) {
+        items.push(item);
+      }
+      if (items.length >= PLAYLIST_MAX_TRACKS) {
+        break;
+      }
+    }
+
+    const nextOffset = content?.pagingInfo?.nextOffset;
+    if (!Number.isInteger(nextOffset) || nextOffset <= offset || rows.length === 0) {
+      break;
+    }
+
+    offset = nextOffset;
+  }
+
+  return { items, expectedTotal };
 }
 
 function queueTrackFromSpotifyHtml(track, requestedBy) {
@@ -2532,6 +2615,49 @@ function queueTrackFromSpotifyHtml(track, requestedBy) {
 }
 
 async function spotifyFallbackPlaylistTracks(spotifyId, requestedBy) {
+  let partnerFailure = null;
+  try {
+    const { items, expectedTotal } = await spotifyPartnerPlaylistTracks(
+      spotifyId,
+      requestedBy,
+      spotifyPublicToken,
+    );
+    if (spotifyPlaylistLooksComplete(items.length, expectedTotal)) {
+      return items;
+    }
+    if (items.length > 0) {
+      logger.warn(
+        `Spotify public partner playlist fallback was partial for ${spotifyId}: resolved ${items.length} of ${expectedTotal}.`,
+      );
+    }
+  } catch (error) {
+    partnerFailure = error;
+    logger.warn(`Spotify public partner playlist fallback failed: ${error.message}`);
+  }
+
+  if (currentSpotifyRefreshToken() && SPOTIFY_CLIENT_ID && SPOTIFY_CLIENT_SECRET) {
+    try {
+      const { items, expectedTotal } = await spotifyPartnerPlaylistTracks(
+        spotifyId,
+        requestedBy,
+        spotifyUserAccessToken,
+      );
+      if (spotifyPlaylistLooksComplete(items.length, expectedTotal)) {
+        return items;
+      }
+      if (items.length > 0) {
+        logger.warn(
+          `Spotify user partner playlist fallback was partial for ${spotifyId}: resolved ${items.length} of ${expectedTotal}.`,
+        );
+      }
+    } catch (error) {
+      if (!partnerFailure) {
+        partnerFailure = error;
+      }
+      logger.warn(`Spotify user partner playlist fallback failed: ${error.message}`);
+    }
+  }
+
   let publicTokenFailure = null;
   try {
     const { items, expectedTotal } = await spotifyPlaylistTracksWithToken(
@@ -2581,9 +2707,10 @@ async function spotifyFallbackPlaylistTracks(spotifyId, requestedBy) {
     }
   }
   if (items.length > 0 && !spotifyPlaylistLooksComplete(items.length, expectedTotal)) {
-    const publicTokenDetail = publicTokenFailure ? ` Public-token lookup failed first: ${publicTokenFailure.message}.` : "";
-    throw new Error(
-      `Spotify playlist expansion only resolved ${items.length} of ${expectedTotal} tracks.${publicTokenDetail} Configure SPOTIFY_REFRESH_TOKEN for a Spotify account that owns the playlist or is a collaborator. SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET and SPOTIFY_MARKET alone are not enough for full playlist imports.`,
+    const partnerDetail = partnerFailure ? ` Public playlist scrape failed first: ${partnerFailure.message}.` : "";
+    const publicTokenDetail = publicTokenFailure ? ` Public-token API lookup failed after that: ${publicTokenFailure.message}.` : "";
+    logger.warn(
+      `Spotify playlist expansion is continuing with ${items.length} of ${expectedTotal} tracks.${partnerDetail}${publicTokenDetail}`,
     );
   }
   return items;
