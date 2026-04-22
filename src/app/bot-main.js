@@ -129,6 +129,10 @@ const RADIO_RECENT_TRACKS_LIMIT = Math.max(
 );
 const SPOTIFY_CLIENT_ID = env("SPOTIFY_CLIENT_ID") || env("SPOTIPY_CLIENT_ID");
 const SPOTIFY_CLIENT_SECRET = env("SPOTIFY_CLIENT_SECRET") || env("SPOTIPY_CLIENT_SECRET");
+const SPOTIFY_REFRESH_TOKEN = env("SPOTIFY_REFRESH_TOKEN");
+const SPOTIFY_REDIRECT_URI = env("SPOTIFY_REDIRECT_URI");
+const SPOTIFY_REFRESH_TOKEN_PATH = env("SPOTIFY_REFRESH_TOKEN_PATH", path.join(RECORDINGS_DIR, "_spotify-refresh-token"));
+const SPOTIFY_OAUTH_SETUP_SECRET = env("SPOTIFY_OAUTH_SETUP_SECRET");
 const DISCORD_CLIENT_ID = env("DISCORD_CLIENT_ID");
 const DISCORD_CLIENT_SECRET = env("DISCORD_CLIENT_SECRET");
 const DISCORD_REDIRECT_URI = env("DISCORD_REDIRECT_URI");
@@ -152,6 +156,7 @@ const SPOTIFY_URL_RE = /^https?:\/\/open\.spotify\.com\/(track|album|playlist)\/
 const SPOTIFY_TITLE_RE = /<meta property="og:title" content="([^"]+)"/i;
 const SPOTIFY_DESC_RE = /<meta property="og:description" content="([^"]+)"/i;
 const SPOTIFY_INITIAL_STATE_RE = /<script id="initialState" type="text\/plain">(.*?)<\/script>/is;
+const SPOTIFY_OAUTH_SCOPES = "playlist-read-private playlist-read-collaborative";
 const RECORDINGS_TTL_MS = RECORDINGS_TTL_DAYS * 24 * 60 * 60 * 1000;
 const RECENT_RECORDINGS_MS = RECENT_RECORDINGS_DAYS * 24 * 60 * 60 * 1000;
 const LOCAL_YTDLP_PATH = path.join(BOT_DIR, ".venv", "Scripts", "yt-dlp.exe");
@@ -159,6 +164,7 @@ const INSTANCE_LOCK_PATH = path.join(BOT_DIR, ".bot.lock");
 const RECORDING_METADATA_FILE = "session.json";
 const WEB_SESSION_COOKIE_NAME = "recfile_session";
 const OAUTH_STATE_COOKIE_NAME = "recfile_oauth";
+const SPOTIFY_OAUTH_STATE_COOKIE_NAME = "spotify_oauth";
 const WEB_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const AUDIO_FILE_EXTENSIONS = new Set([".wav", ".flac", ".ogg", ".opus", ".mp3", ".m4a", ".aac"]);
 const ARCHIVE_AUDIO_EXTENSION = ".ogg";
@@ -184,6 +190,7 @@ const SUPERVISOR_CONTRACT_VERSION = 1;
 const RUNTIME_VERSION = getRuntimeVersion();
 
 let spotifyTokenCache = null;
+let spotifyUserTokenCache = null;
 let downloadBaseUrl = DOWNLOAD_BASE_URL;
 let downloadServer = null;
 let presenceCycleIndex = 0;
@@ -671,6 +678,20 @@ function hasDiscordWebAuth() {
   return Boolean(DISCORD_CLIENT_ID && DISCORD_CLIENT_SECRET && DISCORD_REDIRECT_URI && WEB_SESSION_SECRET);
 }
 
+function spotifyRedirectUri() {
+  return SPOTIFY_REDIRECT_URI || `${downloadBaseUrl.replace(/\/$/, "")}/auth/spotify/callback`;
+}
+
+function hasSpotifyWebAuth() {
+  return Boolean(
+    SPOTIFY_CLIENT_ID
+      && SPOTIFY_CLIENT_SECRET
+      && spotifyRedirectUri()
+      && WEB_SESSION_SECRET
+      && SPOTIFY_OAUTH_SETUP_SECRET,
+  );
+}
+
 function parseCookieHeader(header) {
   const cookies = {};
   for (const entry of String(header || "").split(";")) {
@@ -787,6 +808,79 @@ function sanitizeReturnPath(value) {
     return "/recordings/";
   }
   return value;
+}
+
+function timingSafeSecretEquals(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") {
+    return false;
+  }
+  const leftBuffer = Buffer.from(left, "utf8");
+  const rightBuffer = Buffer.from(right, "utf8");
+  return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function spotifySetupSecretFromRequest(req) {
+  if (typeof req.query.setup === "string" && req.query.setup.length > 0) {
+    return req.query.setup;
+  }
+  const headerValue = req.headers["x-setup-secret"];
+  return typeof headerValue === "string" && headerValue.length > 0 ? headerValue : "";
+}
+
+function currentSpotifyRefreshToken() {
+  if (SPOTIFY_REFRESH_TOKEN) {
+    return SPOTIFY_REFRESH_TOKEN;
+  }
+
+  try {
+    const value = fs.readFileSync(SPOTIFY_REFRESH_TOKEN_PATH, "utf8").trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveSpotifyRefreshToken(refreshToken) {
+  const token = String(refreshToken || "").trim();
+  if (!token) {
+    throw new Error("Spotify OAuth did not return a refresh token.");
+  }
+
+  await fsp.mkdir(path.dirname(SPOTIFY_REFRESH_TOKEN_PATH), { recursive: true });
+  await fsp.writeFile(SPOTIFY_REFRESH_TOKEN_PATH, `${token}\n`, { mode: 0o600 });
+  spotifyUserTokenCache = null;
+}
+
+function renderSpotifyAuthResultPage({ title, message, details = null }) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: #101419; color: #f5f7fa; }
+    main { max-width: 720px; margin: 10vh auto; padding: 32px 24px; }
+    .card { background: #18212b; border: 1px solid #2c3948; border-radius: 16px; padding: 24px; box-shadow: 0 18px 50px rgba(0,0,0,0.35); }
+    h1 { margin-top: 0; font-size: 1.8rem; }
+    p, li { line-height: 1.55; color: #d6dee8; }
+    code { background: #0f1720; padding: 0.15em 0.35em; border-radius: 6px; }
+    pre { background: #0f1720; padding: 14px; border-radius: 10px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+    a { color: #8ad7ff; }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>${escapeHtml(title)}</h1>
+      <p>${escapeHtml(message)}</p>
+      ${details ? `<pre>${escapeHtml(details)}</pre>` : ""}
+      <p><a href="/recordings/help/">Back to recordings help</a></p>
+    </section>
+  </main>
+</body>
+</html>`;
 }
 
 function discordAvatarUrl(user) {
@@ -2171,6 +2265,40 @@ async function spotifyAccessToken() {
   return spotifyTokenCache.token;
 }
 
+async function spotifyUserAccessToken() {
+  const refreshToken = currentSpotifyRefreshToken();
+  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET || !refreshToken) {
+    return null;
+  }
+
+  if (spotifyUserTokenCache && spotifyUserTokenCache.expiresAt > Date.now() + 30_000) {
+    return spotifyUserTokenCache.token;
+  }
+
+  const response = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64")}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Spotify user token request failed with status ${response.status}`);
+  }
+
+  const payload = await response.json();
+  spotifyUserTokenCache = {
+    token: payload.access_token,
+    expiresAt: Date.now() + (payload.expires_in || 3600) * 1000,
+  };
+  return spotifyUserTokenCache.token;
+}
+
 async function spotifyApiGet(pathname) {
   const token = await spotifyAccessToken();
   if (!token) {
@@ -2293,7 +2421,7 @@ async function spotifyPlaylistTracksWithToken(spotifyId, requestedBy, getToken) 
 
     const rows = payload.items || [];
     for (const row of rows) {
-      const item = queueTrackFromSpotifyApi(row.track, requestedBy);
+      const item = queueTrackFromSpotifyApi(row.item || row.track, requestedBy);
       if (item) {
         items.push(item);
       }
@@ -2404,6 +2532,7 @@ function queueTrackFromSpotifyHtml(track, requestedBy) {
 }
 
 async function spotifyFallbackPlaylistTracks(spotifyId, requestedBy) {
+  let publicTokenFailure = null;
   try {
     const { items, expectedTotal } = await spotifyPlaylistTracksWithToken(
       spotifyId,
@@ -2419,6 +2548,7 @@ async function spotifyFallbackPlaylistTracks(spotifyId, requestedBy) {
       );
     }
   } catch (error) {
+    publicTokenFailure = error;
     logger.warn(`Spotify public playlist fallback failed: ${error.message}`);
   }
 
@@ -2451,8 +2581,9 @@ async function spotifyFallbackPlaylistTracks(spotifyId, requestedBy) {
     }
   }
   if (items.length > 0 && !spotifyPlaylistLooksComplete(items.length, expectedTotal)) {
+    const publicTokenDetail = publicTokenFailure ? ` Public-token lookup failed first: ${publicTokenFailure.message}.` : "";
     throw new Error(
-      `Spotify playlist expansion only resolved ${items.length} of ${expectedTotal} tracks. Check SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET and SPOTIFY_MARKET.`,
+      `Spotify playlist expansion only resolved ${items.length} of ${expectedTotal} tracks.${publicTokenDetail} Configure SPOTIFY_REFRESH_TOKEN for a Spotify account that owns the playlist or is a collaborator. SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET and SPOTIFY_MARKET alone are not enough for full playlist imports.`,
     );
   }
   return items;
@@ -2503,6 +2634,29 @@ async function resolveSpotifySources(url, requestedBy) {
   }
 
   if (kind === "playlist") {
+    let spotifyUserFailure = null;
+    if (currentSpotifyRefreshToken() && SPOTIFY_CLIENT_ID && SPOTIFY_CLIENT_SECRET) {
+      try {
+        const { items, expectedTotal } = await spotifyPlaylistTracksWithToken(
+          spotifyId,
+          requestedBy,
+          spotifyUserAccessToken,
+        );
+        if (spotifyPlaylistLooksComplete(items.length, expectedTotal)) {
+          return items;
+        }
+        if (items.length > 0) {
+          logger.warn(
+            `Spotify playlist user-token lookup was partial for ${spotifyId}: resolved ${items.length} of ${expectedTotal}.`,
+          );
+        }
+      } catch (error) {
+        spotifyUserFailure = error;
+        logger.warn(`Spotify playlist user-token lookup failed, trying app fallback: ${error.message}`);
+      }
+    }
+
+    let spotifyApiFailure = null;
     if (SPOTIFY_CLIENT_ID && SPOTIFY_CLIENT_SECRET) {
       try {
         const { items, expectedTotal } = await spotifyPlaylistTracksWithToken(
@@ -2519,15 +2673,26 @@ async function resolveSpotifySources(url, requestedBy) {
           );
         }
       } catch (error) {
+        spotifyApiFailure = error;
         logger.warn(`Spotify playlist API lookup failed, trying fallback: ${error.message}`);
       }
     }
 
-    const fallbackItems = await spotifyFallbackPlaylistTracks(spotifyId, requestedBy);
-    if (fallbackItems.length === 0) {
-      throw new Error("No playable tracks found for that Spotify playlist.");
+    try {
+      const fallbackItems = await spotifyFallbackPlaylistTracks(spotifyId, requestedBy);
+      if (fallbackItems.length === 0) {
+        throw new Error("No playable tracks found for that Spotify playlist.");
+      }
+      return fallbackItems;
+    } catch (error) {
+      if (spotifyUserFailure) {
+        error.message = `${error.message} Spotify user-token lookup failed first: ${spotifyUserFailure.message}.`;
+      }
+      if (spotifyApiFailure) {
+        error.message = `${error.message} Spotify API lookup failed first: ${spotifyApiFailure.message}.`;
+      }
+      throw error;
     }
-    return fallbackItems;
   }
 
   if (kind === "album") {
@@ -3456,6 +3621,18 @@ function buildDiscordAuthorizationUrl(state) {
   return `https://discord.com/oauth2/authorize?${params.toString()}`;
 }
 
+function buildSpotifyAuthorizationUrl(state) {
+  const params = new URLSearchParams({
+    client_id: SPOTIFY_CLIENT_ID,
+    response_type: "code",
+    redirect_uri: spotifyRedirectUri(),
+    scope: SPOTIFY_OAUTH_SCOPES,
+    state,
+    show_dialog: "true",
+  });
+  return `https://accounts.spotify.com/authorize?${params.toString()}`;
+}
+
 async function exchangeDiscordCodeForToken(code) {
   const params = new URLSearchParams({
     client_id: DISCORD_CLIENT_ID,
@@ -3483,6 +3660,27 @@ async function fetchDiscordIdentity(accessToken) {
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || !payload?.id) {
     throw new Error(payload?.message || "Discord user lookup failed.");
+  }
+  return payload;
+}
+
+async function exchangeSpotifyCodeForToken(code) {
+  const params = new URLSearchParams({
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: spotifyRedirectUri(),
+  });
+  const response = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64")}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: params,
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload?.access_token) {
+    throw new Error(payload?.error_description || payload?.error || "Spotify OAuth token exchange failed.");
   }
   return payload;
 }
@@ -3615,9 +3813,97 @@ async function startDownloadServer() {
     }
   });
 
+  app.get("/auth/spotify/login", async (req, res) => {
+    if (!hasSpotifyWebAuth()) {
+      res.status(503).type("html").send(
+        renderSpotifyAuthResultPage({
+          title: "Spotify OAuth Not Configured",
+          message: "Set SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI, WEB_SESSION_SECRET, and SPOTIFY_OAUTH_SETUP_SECRET first.",
+          details: `Expected redirect URI: ${spotifyRedirectUri()}`,
+        }),
+      );
+      return;
+    }
+
+    if (!timingSafeSecretEquals(spotifySetupSecretFromRequest(req), SPOTIFY_OAUTH_SETUP_SECRET)) {
+      res.status(403).type("html").send(
+        renderSpotifyAuthResultPage({
+          title: "Spotify OAuth Locked",
+          message: "Provide the setup secret to start Spotify linking.",
+          details: 'Open /auth/spotify/login?setup=YOUR_SETUP_SECRET while signed into the dedicated Spotify bot account.',
+        }),
+      );
+      return;
+    }
+
+    const nextPath = sanitizeReturnPath(typeof req.query.next === "string" ? req.query.next : "/recordings/help/");
+    const nonce = crypto.randomBytes(18).toString("base64url");
+    const statePayload = {
+      nonce,
+      nextPath,
+      exp: Date.now() + 10 * 60 * 1000,
+    };
+    setCookie(res, SPOTIFY_OAUTH_STATE_COOKIE_NAME, encodeSignedPayload(statePayload), {
+      maxAge: 10 * 60,
+    });
+    res.redirect(buildSpotifyAuthorizationUrl(nonce));
+  });
+
+  app.get("/auth/spotify/callback", async (req, res) => {
+    if (!hasSpotifyWebAuth()) {
+      res.status(503).type("html").send(
+        renderSpotifyAuthResultPage({
+          title: "Spotify OAuth Not Configured",
+          message: "Spotify web auth is not configured on this bot.",
+          details: `Expected redirect URI: ${spotifyRedirectUri()}`,
+        }),
+      );
+      return;
+    }
+
+    try {
+      const cookies = parseCookieHeader(req.headers.cookie);
+      const storedState = decodeSignedPayload(cookies[SPOTIFY_OAUTH_STATE_COOKIE_NAME]);
+      const receivedState = typeof req.query.state === "string" ? req.query.state : "";
+      const code = typeof req.query.code === "string" ? req.query.code : "";
+      if (!storedState?.nonce || !receivedState || storedState.nonce !== receivedState || !code) {
+        throw new Error("Spotify login state could not be validated.");
+      }
+
+      const tokenPayload = await exchangeSpotifyCodeForToken(code);
+      if (!tokenPayload.refresh_token && !currentSpotifyRefreshToken()) {
+        throw new Error("Spotify did not return a refresh token. Re-run the flow with show_dialog enabled.");
+      }
+
+      if (tokenPayload.refresh_token) {
+        await saveSpotifyRefreshToken(tokenPayload.refresh_token);
+      }
+
+      clearCookie(res, SPOTIFY_OAUTH_STATE_COOKIE_NAME);
+      res.status(200).type("html").send(
+        renderSpotifyAuthResultPage({
+          title: "Spotify Bot Account Linked",
+          message: "The Spotify refresh token is now stored on the server and playlist expansion can use the bot account.",
+          details: `Stored token path: ${SPOTIFY_REFRESH_TOKEN_PATH}\nScopes: ${tokenPayload.scope || SPOTIFY_OAUTH_SCOPES}\nRedirect URI: ${spotifyRedirectUri()}`,
+        }),
+      );
+    } catch (error) {
+      logger.warn(`Spotify web login failed: ${error.message}`);
+      clearCookie(res, SPOTIFY_OAUTH_STATE_COOKIE_NAME);
+      res.status(400).type("html").send(
+        renderSpotifyAuthResultPage({
+          title: "Spotify Linking Failed",
+          message: error.message,
+          details: `Configured redirect URI: ${spotifyRedirectUri()}`,
+        }),
+      );
+    }
+  });
+
   app.get("/auth/logout", (req, res) => {
     clearCookie(res, WEB_SESSION_COOKIE_NAME);
     clearCookie(res, OAUTH_STATE_COOKIE_NAME);
+    clearCookie(res, SPOTIFY_OAUTH_STATE_COOKIE_NAME);
     const nextPath = sanitizeReturnPath(typeof req.query.next === "string" ? req.query.next : "/recordings/");
     res.redirect(nextPath);
   });

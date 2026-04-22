@@ -60,9 +60,13 @@ This bot can:
 - `RADIO_MIN_BUFFER_TRACKS` - minimum upcoming tracks radio keeps queued, default `3`
 - `RADIO_RECENT_TRACKS_LIMIT` - recent-track dedupe window for radio, default `30`
 - `RECORDING_RESUBSCRIBE_DELAY_MS` - delay before retrying a speaker stream after a bad packet/decode error, default `350`
-- `SPOTIFY_CLIENT_ID` - recommended for Spotify track, playlist, and album expansion
-- `SPOTIFY_CLIENT_SECRET` - recommended for Spotify track, playlist, and album expansion
+- `SPOTIFY_CLIENT_ID` - required for Spotify metadata lookups and token refresh
+- `SPOTIFY_CLIENT_SECRET` - required for Spotify metadata lookups and token refresh
 - `SPOTIFY_MARKET` - market code used for Spotify metadata lookups when no user token is available, default `US`
+- `SPOTIFY_REFRESH_TOKEN` - recommended for full Spotify playlist expansion using a dedicated Spotify account that owns the playlist or is a collaborator
+- `SPOTIFY_REDIRECT_URI` - optional explicit callback URL for the built-in Spotify OAuth web flow, default `${DOWNLOAD_BASE_URL}/auth/spotify/callback`
+- `SPOTIFY_REFRESH_TOKEN_PATH` - optional file path where the built-in Spotify OAuth web flow stores the refresh token when `SPOTIFY_REFRESH_TOKEN` is not set
+- `SPOTIFY_OAUTH_SETUP_SECRET` - required secret for opening the built-in Spotify OAuth link route safely
 - `PLAYLIST_MAX_TRACKS` - max tracks imported from one playlist or album, default `200`
 - `SUPERVISOR_TOKEN` - optional bearer token required by the local-only `/internal/ota/*` supervisor endpoints
 
