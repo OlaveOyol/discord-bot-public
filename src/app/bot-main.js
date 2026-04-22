@@ -157,7 +157,8 @@ const SPOTIFY_TITLE_RE = /<meta property="og:title" content="([^"]+)"/i;
 const SPOTIFY_DESC_RE = /<meta property="og:description" content="([^"]+)"/i;
 const SPOTIFY_INITIAL_STATE_RE = /<script id="initialState" type="text\/plain">(.*?)<\/script>/is;
 const SPOTIFY_OAUTH_SCOPES = "playlist-read-private playlist-read-collaborative";
-const SPOTIFY_PARTNER_PLAYLIST_QUERY_HASH = "6f7fef1ef9760ba77aeb68d8153d458eeec2dce3430cef02b5f094a8ef9a465d";
+const SPOTIFY_PARTNER_PLAYLIST_QUERY_NAME = "queryPlaylist";
+const SPOTIFY_PARTNER_PLAYLIST_QUERY_HASH = "908a5597b4d0af0489a9ad6a2d41bc3b416ff47c0884016d92bbd6822d0eb6d8";
 const RECORDINGS_TTL_MS = RECORDINGS_TTL_DAYS * 24 * 60 * 60 * 1000;
 const RECENT_RECORDINGS_MS = RECENT_RECORDINGS_DAYS * 24 * 60 * 60 * 1000;
 const LOCAL_YTDLP_PATH = path.join(BOT_DIR, ".venv", "Scripts", "yt-dlp.exe");
@@ -2353,27 +2354,24 @@ function spotifyApiUrl(pathnameOrUrl, params = {}) {
   return url;
 }
 
-function spotifyPartnerPlaylistUrl(spotifyId, offset = 0, limit = 100) {
-  const url = new URL("https://api-partner.spotify.com/pathfinder/v1/query");
-  url.searchParams.set("operationName", "fetchPlaylistMetadata");
-  url.searchParams.set(
-    "variables",
-    JSON.stringify({
-      uri: `spotify:playlist:${spotifyId}`,
-      offset,
-      limit,
-    }),
-  );
-  url.searchParams.set(
-    "extensions",
-    JSON.stringify({
-      persistedQuery: {
-        version: 1,
-        sha256Hash: SPOTIFY_PARTNER_PLAYLIST_QUERY_HASH,
+function spotifyPartnerPlaylistRequest(spotifyId, offset = 0, limit = 100) {
+  return {
+    url: "https://api-partner.spotify.com/pathfinder/v1/query",
+    body: {
+      operationName: SPOTIFY_PARTNER_PLAYLIST_QUERY_NAME,
+      variables: {
+        uri: `spotify:playlist:${spotifyId}`,
+        offset,
+        limit,
       },
-    }),
-  );
-  return url;
+      extensions: {
+        persistedQuery: {
+          version: 1,
+          sha256Hash: SPOTIFY_PARTNER_PLAYLIST_QUERY_HASH,
+        },
+      },
+    },
+  };
 }
 
 function spotifyPlaylistLooksComplete(itemCount, expectedTotal) {
@@ -2551,12 +2549,16 @@ async function spotifyPartnerPlaylistTracks(spotifyId, requestedBy, getToken) {
 
     const remaining = PLAYLIST_MAX_TRACKS - items.length;
     const limit = Math.max(1, Math.min(pageLimit, remaining));
-    const response = await fetch(spotifyPartnerPlaylistUrl(spotifyId, offset, limit), {
+    const request = spotifyPartnerPlaylistRequest(spotifyId, offset, limit);
+    const response = await fetch(request.url, {
+      method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: "application/json",
+        "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0",
       },
+      body: JSON.stringify(request.body),
     });
 
     if (!response.ok) {
