@@ -64,6 +64,15 @@ function env(name, fallback = undefined) {
   return cleaned.length ? cleaned : fallback;
 }
 
+function envBoolean(name, fallback = false) {
+  const value = env(name);
+  if (value === undefined) {
+    return fallback;
+  }
+
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
 const TOKEN = env("DISCORD_TOKEN");
 if (!TOKEN) {
   throw new Error("DISCORD_TOKEN is not set");
@@ -116,6 +125,15 @@ const SUPERVISOR_PREPARE_TIMEOUT_SECONDS = Math.max(
 const PLAYLIST_MAX_TRACKS = Math.max(
   1,
   Number.parseInt(env("PLAYLIST_MAX_TRACKS", "500"), 10),
+);
+const PLAYBACK_VOLUME_NORMALIZATION = envBoolean("PLAYBACK_VOLUME_NORMALIZATION", true);
+const PLAYBACK_VOLUME_NORMALIZATION_FILTER = env(
+  "PLAYBACK_VOLUME_NORMALIZATION_FILTER",
+  "loudnorm=I=-16:TP=-1.5:LRA=11",
+);
+const PLAYBACK_AUDIO_SEARCH_CANDIDATES = Math.max(
+  1,
+  Math.min(25, Number.parseInt(env("PLAYBACK_AUDIO_SEARCH_CANDIDATES", "10"), 10)),
 );
 const SPOTIFY_MARKET = env("SPOTIFY_MARKET", "US")?.toUpperCase();
 const SPOTIFY_PLAYLIST_PAGE_SIZE = 50;
@@ -580,7 +598,7 @@ function normalizePlaybackQuery(query) {
 }
 
 function spotifySearchQuery(name, artists) {
-  return `${name} ${artists.join(" ")} audio`.trim();
+  return `${name} ${artists.join(" ")} official audio`.trim();
 }
 
 function formatDateTime(value) {
@@ -2861,8 +2879,162 @@ async function resolveSpotifySources(url, requestedBy) {
   return [];
 }
 
-async function resolveSearchTracks(query, requestedBy, limit = 1) {
+function audioFocusedSearchQuery(query) {
+  const cleaned = String(query || "").trim();
+  if (!cleaned || /\bofficial\s+audio\b/i.test(cleaned)) {
+    return cleaned;
+  }
+  return `${cleaned} official audio`;
+}
+
+function parseSearchCandidateDuration(value) {
+  if (Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value));
+  }
+
+  const parts = String(value || "")
+    .split(":")
+    .map((part) => Number.parseInt(part, 10));
+  if (parts.length < 2 || parts.some((part) => !Number.isFinite(part))) {
+    return null;
+  }
+
+  return parts.reduce((total, part) => total * 60 + part, 0);
+}
+
+function searchCandidateWebpageUrl(candidate) {
+  const webpageUrl = candidate?.webpage_url || candidate?.webpageUrl;
+  if (isHttpUrl(webpageUrl)) {
+    return webpageUrl;
+  }
+
+  const url = candidate?.url;
+  if (isHttpUrl(url)) {
+    return url;
+  }
+
+  const id = candidate?.id || (typeof url === "string" && /^[A-Za-z0-9_-]{11}$/.test(url) ? url : null);
+  return id ? `https://www.youtube.com/watch?v=${id}` : null;
+}
+
+function searchCandidateScore(candidate, { query, expectedDuration = null, index = 0 } = {}) {
+  const title = String(candidate?.title || "").toLowerCase();
+  const channel = String(candidate?.channel || candidate?.uploader || candidate?.uploader_id || "").toLowerCase();
+  const description = String(candidate?.description || "").toLowerCase();
+  const queryText = String(query || "").toLowerCase();
+  let score = 100 - index;
+
+  if (/\btopic$/.test(channel) || /\s-\stopic$/.test(channel)) {
+    score += 70;
+  }
+  if (description.includes("provided to youtube by")) {
+    score += 45;
+  }
+  if (/\bofficial\s+audio\b/.test(title)) {
+    score += 55;
+  } else if (/(^|[\s([_-])audio($|[\s)\]_-])/.test(title)) {
+    score += 30;
+  }
+  if (/\blyric(s)?\b/.test(title)) {
+    score += 8;
+  }
+
+  if (/\bofficial\s+(music\s+)?video\b|\bmusic\s+video\b|(^|[\s([_-])mv($|[\s)\]_-])/.test(title)) {
+    score -= 85;
+  }
+  if (/\blive\b|\bconcert\b|\bsession\b/.test(title) && !/\blive\b/.test(queryText)) {
+    score -= 45;
+  }
+  if (/\bcover\b|\bkaraoke\b|\binstrumental\b|\breaction\b|\btrailer\b/.test(title)) {
+    score -= 70;
+  }
+  if (/\bremix\b/.test(title) && !/\bremix\b/.test(queryText)) {
+    score -= 35;
+  }
+  if (/\bsped\s+up\b|\bslowed\b|\bnightcore\b|\b8d\b/.test(title)) {
+    score -= 55;
+  }
+
+  const duration = parseSearchCandidateDuration(candidate?.duration);
+  if (Number.isFinite(expectedDuration) && duration !== null) {
+    const diff = Math.abs(duration - expectedDuration);
+    if (diff <= 2) {
+      score += 40;
+    } else if (diff <= 5) {
+      score += 25;
+    } else if (diff <= 12) {
+      score += 10;
+    } else if (diff > 30) {
+      score -= 35;
+    }
+  }
+
+  return score;
+}
+
+async function resolveYtDlpAudioSearchTracks(query, requestedBy, limit, options = {}) {
+  const candidateLimit = Math.max(limit, PLAYBACK_AUDIO_SEARCH_CANDIDATES);
+  const { stdout } = await runYtDlp([
+    "--force-ipv4",
+    "--no-progress",
+    "--skip-download",
+    "--dump-json",
+    "--flat-playlist",
+    `ytsearch${candidateLimit}:${audioFocusedSearchQuery(query)}`,
+  ]);
+  const candidates = String(stdout || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .map((candidate, index) => ({
+      candidate,
+      index,
+      score: searchCandidateScore(candidate, {
+        query,
+        expectedDuration: options.expectedDuration,
+        index,
+      }),
+    }))
+    .sort((left, right) => right.score - left.score);
+
+  return candidates
+    .slice(0, limit)
+    .map(({ candidate }) => {
+      const webpageUrl = searchCandidateWebpageUrl(candidate);
+      if (!webpageUrl) {
+        return null;
+      }
+
+      return createTrack({
+        title: candidate.title,
+        webpageUrl,
+        duration: parseSearchCandidateDuration(candidate.duration),
+        thumbnail: candidate.thumbnail || candidate.thumbnails?.at(-1)?.url || null,
+        requestedBy,
+      });
+    })
+    .filter(Boolean);
+}
+
+async function resolveSearchTracks(query, requestedBy, limit = 1, options = {}) {
   const safeLimit = Math.max(1, Math.min(10, limit));
+  try {
+    const tracks = await resolveYtDlpAudioSearchTracks(query, requestedBy, safeLimit, options);
+    if (tracks.length > 0) {
+      return tracks;
+    }
+  } catch (error) {
+    logger.warn(`yt-dlp audio-focused search failed for '${query}': ${error.message}`);
+  }
+
   const results = await play.search(query, {
     limit: safeLimit,
     source: { youtube: "video" },
@@ -2878,8 +3050,8 @@ async function resolveSearchTracks(query, requestedBy, limit = 1) {
   );
 }
 
-async function resolveSearchTrack(query, requestedBy) {
-  const tracks = await resolveSearchTracks(query, requestedBy, 1);
+async function resolveSearchTrack(query, requestedBy, options = {}) {
+  const tracks = await resolveSearchTracks(query, requestedBy, 1, options);
   const result = tracks[0];
   if (!result) {
     throw new Error("No playable results found for that query.");
@@ -3042,7 +3214,9 @@ async function hydrateTrack(track) {
 
   if (needsSearchResolution) {
     const searchTerm = track.searchQuery || track.title;
-    const result = await resolveSearchTrack(searchTerm, track.requestedBy);
+    const result = await resolveSearchTrack(searchTerm, track.requestedBy, {
+      expectedDuration: track.duration,
+    });
     track.title = result.title;
     track.webpageUrl = result.webpageUrl;
     track.duration = result.duration;
@@ -3075,11 +3249,88 @@ async function createPlaybackResource(track) {
       throw error;
     }
   }
+  if (PLAYBACK_VOLUME_NORMALIZATION) {
+    return { resource: createFfmpegStreamResource(stream.stream, track), stream };
+  }
   const resource = createAudioResource(stream.stream, {
     inputType: stream.type || StreamType.Arbitrary,
     metadata: track,
   });
   return { resource, stream };
+}
+
+function playbackFfmpegFilterArgs() {
+  return PLAYBACK_VOLUME_NORMALIZATION && PLAYBACK_VOLUME_NORMALIZATION_FILTER
+    ? ["-af", PLAYBACK_VOLUME_NORMALIZATION_FILTER]
+    : [];
+}
+
+function createFfmpegStreamResource(inputStream, track) {
+  const ffmpeg = spawn(
+    env("FFMPEG_PATH", "ffmpeg"),
+    [
+      "-probesize",
+      "32M",
+      "-analyzeduration",
+      "32M",
+      "-loglevel",
+      "error",
+      "-i",
+      "pipe:0",
+      "-vn",
+      "-sn",
+      "-dn",
+      ...playbackFfmpegFilterArgs(),
+      "-f",
+      "s16le",
+      "-ar",
+      "48000",
+      "-ac",
+      "2",
+      "pipe:1",
+    ],
+    {
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+
+  const cleanup = () => {
+    if (!ffmpeg.killed) {
+      ffmpeg.kill();
+    }
+    inputStream.destroy?.();
+  };
+
+  inputStream.on?.("error", (error) => {
+    logger.warn(`Playback source stream failed for '${track.title}': ${error.message}`);
+    cleanup();
+  });
+  ffmpeg.stdin.on("error", () => {});
+  ffmpeg.stderr.on("data", (chunk) => {
+    const text = String(chunk || "").trim();
+    if (text) {
+      logger.warn(`ffmpeg playback normalizer for '${track.title}': ${text}`);
+    }
+  });
+  ffmpeg.on("error", (error) => {
+    logger.warn(`FFmpeg playback normalizer failed for '${track.title}': ${error.message}`);
+    cleanup();
+  });
+  ffmpeg.once("close", (code) => {
+    if (code && code !== 0) {
+      logger.warn(`ffmpeg playback normalizer exited with code ${code} for '${track.title}'`);
+    }
+    cleanup();
+  });
+  ffmpeg.stdout.once("close", cleanup);
+  ffmpeg.stdout.once("end", cleanup);
+  inputStream.pipe(ffmpeg.stdin);
+
+  return createAudioResource(ffmpeg.stdout, {
+    inputType: StreamType.Raw,
+    metadata: track,
+  });
 }
 
 function resolveYtDlpPath() {
@@ -3208,6 +3459,7 @@ async function createYouTubeResource(track, url, seekSeconds = 0) {
       "-vn",
       "-sn",
       "-dn",
+      ...playbackFfmpegFilterArgs(),
       "-f",
       "s16le",
       "-ar",
