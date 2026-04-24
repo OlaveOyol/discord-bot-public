@@ -60,6 +60,9 @@ This bot can:
 - `RADIO_MIN_BUFFER_TRACKS` - minimum upcoming tracks radio keeps queued, default `3`
 - `RADIO_RECENT_TRACKS_LIMIT` - recent-track dedupe window for radio, default `30`
 - `RECORDING_RESUBSCRIBE_DELAY_MS` - delay before retrying a speaker stream after a bad packet/decode error, default `350`
+- `PLAYBACK_VOLUME_NORMALIZATION` - enable ffmpeg loudness normalization for playback, default `true`
+- `PLAYBACK_VOLUME_NORMALIZATION_FILTER` - ffmpeg audio filter used for normalization, default `loudnorm=I=-16:TP=-1.5:LRA=11`
+- `PLAYBACK_AUDIO_SEARCH_CANDIDATES` - number of YouTube search candidates scored before queueing a search/Spotify result, default `10`
 - `SPOTIFY_CLIENT_ID` - required for Spotify metadata lookups and token refresh
 - `SPOTIFY_CLIENT_SECRET` - required for Spotify metadata lookups and token refresh
 - `SPOTIFY_MARKET` - market code used for Spotify metadata lookups when no user token is available, default `US`
@@ -125,7 +128,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 
 ## Notes
 
-- Spotify audio is not streamed directly. Spotify links are expanded into metadata and then resolved to a playable source.
+- Spotify audio is not streamed directly. Spotify links are expanded into metadata and then resolved to a playable source, preferring official audio or `- Topic` YouTube uploads over music videos.
 - Spotify playlist links fall back to Spotify web metadata when API calls fail.
 - SoundCloud playback is enabled through `play-dl` and depends on its free client ID lookup succeeding at startup.
 - Commands are synced per guild on startup so they appear quickly in servers the bot is already in.
