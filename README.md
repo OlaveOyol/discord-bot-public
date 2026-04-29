@@ -62,7 +62,7 @@ This bot can:
 - `RECORDING_RESUBSCRIBE_DELAY_MS` - delay before retrying a speaker stream after a bad packet/decode error, default `350`
 - `PLAYBACK_VOLUME_NORMALIZATION` - enable ffmpeg loudness normalization for playback, default `true`
 - `PLAYBACK_VOLUME_NORMALIZATION_FILTER` - ffmpeg audio filter used for normalization, default `loudnorm=I=-16:TP=-1.5:LRA=11`
-- `PLAYBACK_AUDIO_SEARCH_CANDIDATES` - number of SoundCloud/YouTube candidates scored before queueing a search/Spotify result, default `10`
+- `PLAYBACK_AUDIO_SEARCH_CANDIDATES` - number of YouTube candidates scored before queueing an official-audio search/Spotify result, default `10`
 - `SPOTIFY_CLIENT_ID` - required for Spotify metadata lookups and token refresh
 - `SPOTIFY_CLIENT_SECRET` - required for Spotify metadata lookups and token refresh
 - `SPOTIFY_MARKET` - market code used for Spotify metadata lookups when no user token is available, default `US`
@@ -128,13 +128,13 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 
 ## Notes
 
-- Spotify audio is not streamed directly. Spotify links are expanded into metadata and then resolved to a playable source, preferring SoundCloud tracks first and falling back to official audio or `- Topic` YouTube uploads.
+- Spotify audio is not streamed directly. Spotify links are expanded into metadata and then resolved to a playable source, requiring an official audio or `- Topic` YouTube upload.
 - Spotify playlist links fall back to Spotify web metadata when API calls fail.
 - SoundCloud playback is enabled through `play-dl` and depends on its free client ID lookup succeeding at startup.
 - Commands are synced per guild on startup so they appear quickly in servers the bot is already in.
 - graceful restarts now persist the active voice channel, current track offset, queue, and pause state so OTA deploys can resume playback instead of clearing the queue
 - SQLite is used as a lightweight metadata/persistence layer for recordings, playback restart state, and radio state. Audio files and archives still remain on disk.
-- `/radio` uses SoundCloud search first, then YouTube search and YouTube related-video discovery for continuous refill. Spotify is still metadata/discovery only and is not used for native Spotify audio playback.
+- `/radio` uses Spotify metadata search, strict official-audio YouTube lookup, and YouTube related-video discovery for continuous refill. Spotify is still metadata/discovery only and is not used for native Spotify audio playback.
 - Discord voice receive is still not officially documented by Discord, but the Node voice stack here is the chosen path over the previous Python receive extension.
 - The website login uses Discord OAuth `identify` scope only. Session matching works by the Discord user IDs already embedded in per-user WAV filenames.
 - The recordings web UI now lives in `src/web/recordings-web.js` instead of being embedded directly inside the bot routes.
