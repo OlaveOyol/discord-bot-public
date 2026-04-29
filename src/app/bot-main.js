@@ -598,7 +598,7 @@ function normalizePlaybackQuery(query) {
 }
 
 function spotifySearchQuery(name, artists) {
-  return `${name} ${artists.join(" ")} official audio`.trim();
+  return `${name} ${artists.join(" ")}`.trim();
 }
 
 function formatDateTime(value) {
@@ -3024,8 +3024,100 @@ async function resolveYtDlpAudioSearchTracks(query, requestedBy, limit, options 
     .filter(Boolean);
 }
 
+function soundCloudTrackUrl(track) {
+  return [track?.permalink, track?.url].find(isHttpUrl) || null;
+}
+
+function soundCloudTrackTitle(track) {
+  const name = track?.name || track?.title;
+  const artist = track?.user?.name || track?.publisher_metadata?.artist || track?.publisher?.artist;
+  return artist ? `${name || "Unknown title"} - ${artist}` : name || "Unknown title";
+}
+
+function soundCloudTrackDuration(track) {
+  if (Number.isFinite(track?.durationInSec)) {
+    return Math.max(0, Math.floor(track.durationInSec));
+  }
+  if (Number.isFinite(track?.durationInMs)) {
+    return Math.max(0, Math.floor(track.durationInMs / 1000));
+  }
+  return null;
+}
+
+function soundCloudSearchScore(track, { expectedDuration = null, index = 0 } = {}) {
+  let score = 100 - index;
+  const duration = soundCloudTrackDuration(track);
+
+  if (Number.isFinite(expectedDuration) && duration !== null) {
+    const diff = Math.abs(duration - expectedDuration);
+    if (diff <= 2) {
+      score += 45;
+    } else if (diff <= 5) {
+      score += 30;
+    } else if (diff <= 12) {
+      score += 15;
+    } else if (diff > 30) {
+      score -= 80;
+    }
+  }
+
+  return score;
+}
+
+async function resolveSoundCloudSearchTracks(query, requestedBy, limit, options = {}) {
+  if (!soundCloudReady) {
+    return [];
+  }
+
+  const candidateLimit = Number.isFinite(options.expectedDuration)
+    ? Math.max(limit, PLAYBACK_AUDIO_SEARCH_CANDIDATES)
+    : limit;
+  const results = await play.search(query, {
+    limit: candidateLimit,
+    source: { soundcloud: "tracks" },
+  });
+
+  return results
+    .map((track, index) => ({
+      track,
+      index,
+      score: soundCloudSearchScore(track, {
+        expectedDuration: options.expectedDuration,
+        index,
+      }),
+    }))
+    .filter(({ track }) => soundCloudTrackUrl(track))
+    .filter(({ track }) => {
+      if (!Number.isFinite(options.expectedDuration)) {
+        return true;
+      }
+      const duration = soundCloudTrackDuration(track);
+      return duration === null || Math.abs(duration - options.expectedDuration) <= 30;
+    })
+    .sort((left, right) => right.score - left.score)
+    .slice(0, limit)
+    .map(({ track }) =>
+      createTrack({
+        title: soundCloudTrackTitle(track),
+        webpageUrl: soundCloudTrackUrl(track),
+        duration: soundCloudTrackDuration(track),
+        thumbnail: track.thumbnail || track.artwork_url || null,
+        requestedBy,
+      }),
+    );
+}
+
 async function resolveSearchTracks(query, requestedBy, limit = 1, options = {}) {
   const safeLimit = Math.max(1, Math.min(10, limit));
+  try {
+    const tracks = await resolveSoundCloudSearchTracks(query, requestedBy, safeLimit, options);
+    if (tracks.length > 0) {
+      return tracks;
+    }
+  } catch (error) {
+    logger.warn(`SoundCloud search failed for '${query}': ${error.message}`);
+  }
+
   try {
     const tracks = await resolveYtDlpAudioSearchTracks(query, requestedBy, safeLimit, options);
     if (tracks.length > 0) {
@@ -3035,7 +3127,7 @@ async function resolveSearchTracks(query, requestedBy, limit = 1, options = {}) 
     logger.warn(`yt-dlp audio-focused search failed for '${query}': ${error.message}`);
   }
 
-  const results = await play.search(query, {
+  const results = await play.search(audioFocusedSearchQuery(query), {
     limit: safeLimit,
     source: { youtube: "video" },
   });
@@ -3193,6 +3285,10 @@ async function resolveSources(query, requestedBy) {
 
   if (!isHttpUrl(resolvedQuery)) {
     return [await resolveSearchTrack(resolvedQuery, requestedBy)];
+  }
+
+  if (isYouTubeUrl(resolvedQuery)) {
+    return resolveYouTubeSources(resolvedQuery, requestedBy);
   }
 
   const sourceType = await play.validate(resolvedQuery);
