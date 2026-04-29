@@ -2790,9 +2790,9 @@ async function resolveSpotifySources(url, requestedBy) {
       if (!metadataTrack) {
         return [];
       }
-      const [resolvedTrack] = await resolveOfficialAudioTracksFromMetadata([metadataTrack], requestedBy, 1);
+      const [resolvedTrack] = await resolveOfficialPlaybackTracksFromMetadata([metadataTrack], requestedBy, 1);
       if (!resolvedTrack) {
-        throw new Error("No official audio result found for that Spotify track.");
+        throw new Error("No official audio, lyric video, or music video result found for that Spotify track.");
       }
       return [resolvedTrack];
     }
@@ -2980,7 +2980,7 @@ function searchCandidateScore(candidate, { query, expectedDuration = null, index
   return score;
 }
 
-function isOfficialAudioSearchCandidate(candidate, { query, expectedDuration = null } = {}) {
+function officialPlaybackCandidateTier(candidate, { query, expectedDuration = null } = {}) {
   const title = String(candidate?.title || "").toLowerCase();
   const channel = String(candidate?.channel || candidate?.uploader || candidate?.uploader_id || "").toLowerCase();
   const description = String(candidate?.description || "").toLowerCase();
@@ -2991,35 +2991,43 @@ function isOfficialAudioSearchCandidate(candidate, { query, expectedDuration = n
     || /\s-\stopic$/.test(channel)
     || description.includes("provided to youtube by")
     || /\bofficial\s+audio\b/.test(title);
-  if (!hasOfficialAudioSignal) {
-    return false;
+  const hasOfficialLyricSignal = /\bofficial\s+lyric(s)?\s+video\b/.test(title);
+  const hasOfficialVideoSignal = /\bofficial\s+(music\s+)?video\b/.test(title);
+
+  let tier = null;
+  if (hasOfficialAudioSignal) {
+    tier = 0;
+  } else if (hasOfficialLyricSignal) {
+    tier = 1;
+  } else if (hasOfficialVideoSignal) {
+    tier = 2;
+  } else {
+    return null;
   }
 
-  if (/\bofficial\s+(music\s+)?video\b|\bmusic\s+video\b|(^|[\s([_-])mv($|[\s)\]_-])/.test(title)) {
-    return false;
-  }
   if (/\blive\b|\bconcert\b|\bsession\b/.test(title) && !/\blive\b/.test(queryText)) {
-    return false;
+    return null;
   }
-  if (/\bcover\b|\bkaraoke\b|\breaction\b|\btrailer\b|\blyric(s)?\b/.test(title)) {
-    return false;
+  if (/\bcover\b|\bkaraoke\b|\breaction\b|\btrailer\b/.test(title)) {
+    return null;
   }
   if (/\binstrumental\b/.test(title) && !/\binstrumental\b/.test(queryText)) {
-    return false;
+    return null;
   }
   if (/\bremix\b/.test(title) && !/\bremix\b/.test(queryText)) {
-    return false;
+    return null;
   }
   if (/\bsped\s+up\b|\bslowed\b|\bnightcore\b|\b8d\b/.test(title)) {
-    return false;
+    return null;
   }
 
   const duration = parseSearchCandidateDuration(candidate?.duration);
   if (Number.isFinite(expectedDuration)) {
-    return duration !== null && Math.abs(duration - expectedDuration) <= 15;
+    const toleranceSeconds = tier === 0 ? 15 : tier === 1 ? 30 : 45;
+    return duration !== null && Math.abs(duration - expectedDuration) <= toleranceSeconds ? tier : null;
   }
 
-  return true;
+  return tier;
 }
 
 async function resolveYtDlpAudioSearchTracks(query, requestedBy, limit, options = {}) {
@@ -3044,24 +3052,31 @@ async function resolveYtDlpAudioSearchTracks(query, requestedBy, limit, options 
       }
     })
     .filter(Boolean)
-    .map((candidate, index) => ({
-      candidate,
-      index,
-      score: searchCandidateScore(candidate, {
-        query,
-        expectedDuration: options.expectedDuration,
-        index,
-      }),
-    }))
-    .filter(({ candidate }) =>
-      options.requireOfficialAudio
-        ? isOfficialAudioSearchCandidate(candidate, {
+    .map((candidate, index) => {
+      const officialTier = options.requireOfficialPlayback
+        ? officialPlaybackCandidateTier(candidate, {
             query,
             expectedDuration: options.expectedDuration,
           })
-        : true,
-    )
-    .sort((left, right) => right.score - left.score);
+        : null;
+      return {
+        candidate,
+        index,
+        officialTier,
+        score: searchCandidateScore(candidate, {
+          query,
+          expectedDuration: options.expectedDuration,
+          index,
+        }),
+      };
+    })
+    .filter(({ officialTier }) => (options.requireOfficialPlayback ? Number.isInteger(officialTier) : true))
+    .sort((left, right) => {
+      if (options.requireOfficialPlayback && left.officialTier !== right.officialTier) {
+        return left.officialTier - right.officialTier;
+      }
+      return right.score - left.score;
+    });
 
   return candidates
     .slice(0, limit)
@@ -3097,21 +3112,21 @@ async function resolveSpotifySearchTracks(query, requestedBy, limit) {
     .filter(Boolean);
 }
 
-async function resolveOfficialAudioTracksFromMetadata(metadataTracks, requestedBy, limit) {
+async function resolveOfficialPlaybackTracksFromMetadata(metadataTracks, requestedBy, limit) {
   const tracks = [];
   for (const metadataTrack of metadataTracks) {
     const searchTerm = metadataTrack.searchQuery || metadataTrack.title;
     try {
       const [track] = await resolveYtDlpAudioSearchTracks(searchTerm, requestedBy, 1, {
         expectedDuration: metadataTrack.duration,
-        requireOfficialAudio: true,
+        requireOfficialPlayback: true,
       });
       if (track) {
         track.thumbnail = track.thumbnail || metadataTrack.thumbnail;
         tracks.push(track);
       }
     } catch (error) {
-      logger.warn(`Official-audio lookup failed for '${searchTerm}': ${error.message}`);
+      logger.warn(`Official playback lookup failed for '${searchTerm}': ${error.message}`);
     }
 
     if (tracks.length >= limit) {
@@ -3127,7 +3142,7 @@ async function resolveSearchTracks(query, requestedBy, limit = 1, options = {}) 
   if (options.preferSpotifyMetadata !== false && !Number.isFinite(options.expectedDuration)) {
     try {
       const tracks = await resolveSpotifySearchTracks(query, requestedBy, safeLimit);
-      const resolvedTracks = await resolveOfficialAudioTracksFromMetadata(tracks, requestedBy, safeLimit);
+      const resolvedTracks = await resolveOfficialPlaybackTracksFromMetadata(tracks, requestedBy, safeLimit);
       if (resolvedTracks.length > 0) {
         return resolvedTracks;
       }
@@ -3139,13 +3154,13 @@ async function resolveSearchTracks(query, requestedBy, limit = 1, options = {}) 
   try {
     const tracks = await resolveYtDlpAudioSearchTracks(query, requestedBy, safeLimit, {
       ...options,
-      requireOfficialAudio: true,
+      requireOfficialPlayback: true,
     });
     if (tracks.length > 0) {
       return tracks;
     }
   } catch (error) {
-    logger.warn(`yt-dlp official-audio search failed for '${query}': ${error.message}`);
+    logger.warn(`yt-dlp official playback search failed for '${query}': ${error.message}`);
   }
 
   return [];
