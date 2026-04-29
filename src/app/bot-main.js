@@ -598,7 +598,7 @@ function normalizePlaybackQuery(query) {
 }
 
 function spotifySearchQuery(name, artists) {
-  return `${name} ${artists.join(" ")} official audio`.trim();
+  return `${name} ${artists.join(" ")}`.trim();
 }
 
 function formatDateTime(value) {
@@ -2320,13 +2320,13 @@ async function spotifyUserAccessToken() {
   return spotifyUserTokenCache.token;
 }
 
-async function spotifyApiGet(pathname) {
+async function spotifyApiGet(pathname, params = {}) {
   const token = await spotifyAccessToken();
   if (!token) {
     throw new Error("Spotify credentials are not configured.");
   }
 
-  const response = await fetch(spotifyApiUrl(pathname), {
+  const response = await fetch(spotifyApiUrl(pathname, params), {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!response.ok) {
@@ -2786,7 +2786,15 @@ async function resolveSpotifySources(url, requestedBy) {
   if (kind === "track") {
     if (SPOTIFY_CLIENT_ID && SPOTIFY_CLIENT_SECRET) {
       const track = await spotifyApiGet(`tracks/${spotifyId}`);
-      return [queueTrackFromSpotifyApi(track, requestedBy)].filter(Boolean);
+      const metadataTrack = queueTrackFromSpotifyApi(track, requestedBy);
+      if (!metadataTrack) {
+        return [];
+      }
+      const [resolvedTrack] = await resolveOfficialAudioTracksFromMetadata([metadataTrack], requestedBy, 1);
+      if (!resolvedTrack) {
+        throw new Error("No official audio result found for that Spotify track.");
+      }
+      return [resolvedTrack];
     }
 
     const query = await resolveSpotifyQuery(url);
@@ -2972,6 +2980,48 @@ function searchCandidateScore(candidate, { query, expectedDuration = null, index
   return score;
 }
 
+function isOfficialAudioSearchCandidate(candidate, { query, expectedDuration = null } = {}) {
+  const title = String(candidate?.title || "").toLowerCase();
+  const channel = String(candidate?.channel || candidate?.uploader || candidate?.uploader_id || "").toLowerCase();
+  const description = String(candidate?.description || "").toLowerCase();
+  const queryText = String(query || "").toLowerCase();
+
+  const hasOfficialAudioSignal =
+    /\btopic$/.test(channel)
+    || /\s-\stopic$/.test(channel)
+    || description.includes("provided to youtube by")
+    || /\bofficial\s+audio\b/.test(title);
+  if (!hasOfficialAudioSignal) {
+    return false;
+  }
+
+  if (/\bofficial\s+(music\s+)?video\b|\bmusic\s+video\b|(^|[\s([_-])mv($|[\s)\]_-])/.test(title)) {
+    return false;
+  }
+  if (/\blive\b|\bconcert\b|\bsession\b/.test(title) && !/\blive\b/.test(queryText)) {
+    return false;
+  }
+  if (/\bcover\b|\bkaraoke\b|\breaction\b|\btrailer\b|\blyric(s)?\b/.test(title)) {
+    return false;
+  }
+  if (/\binstrumental\b/.test(title) && !/\binstrumental\b/.test(queryText)) {
+    return false;
+  }
+  if (/\bremix\b/.test(title) && !/\bremix\b/.test(queryText)) {
+    return false;
+  }
+  if (/\bsped\s+up\b|\bslowed\b|\bnightcore\b|\b8d\b/.test(title)) {
+    return false;
+  }
+
+  const duration = parseSearchCandidateDuration(candidate?.duration);
+  if (Number.isFinite(expectedDuration)) {
+    return duration !== null && Math.abs(duration - expectedDuration) <= 15;
+  }
+
+  return true;
+}
+
 async function resolveYtDlpAudioSearchTracks(query, requestedBy, limit, options = {}) {
   const candidateLimit = Math.max(limit, PLAYBACK_AUDIO_SEARCH_CANDIDATES);
   const { stdout } = await runYtDlp([
@@ -3003,6 +3053,14 @@ async function resolveYtDlpAudioSearchTracks(query, requestedBy, limit, options 
         index,
       }),
     }))
+    .filter(({ candidate }) =>
+      options.requireOfficialAudio
+        ? isOfficialAudioSearchCandidate(candidate, {
+            query,
+            expectedDuration: options.expectedDuration,
+          })
+        : true,
+    )
     .sort((left, right) => right.score - left.score);
 
   return candidates
@@ -3024,30 +3082,73 @@ async function resolveYtDlpAudioSearchTracks(query, requestedBy, limit, options 
     .filter(Boolean);
 }
 
+async function resolveSpotifySearchTracks(query, requestedBy, limit) {
+  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
+    return [];
+  }
+
+  const payload = await spotifyApiGet("search", {
+    q: query,
+    type: "track",
+    limit,
+  });
+  return (payload?.tracks?.items || [])
+    .map((track) => queueTrackFromSpotifyApi(track, requestedBy))
+    .filter(Boolean);
+}
+
+async function resolveOfficialAudioTracksFromMetadata(metadataTracks, requestedBy, limit) {
+  const tracks = [];
+  for (const metadataTrack of metadataTracks) {
+    const searchTerm = metadataTrack.searchQuery || metadataTrack.title;
+    try {
+      const [track] = await resolveYtDlpAudioSearchTracks(searchTerm, requestedBy, 1, {
+        expectedDuration: metadataTrack.duration,
+        requireOfficialAudio: true,
+      });
+      if (track) {
+        track.thumbnail = track.thumbnail || metadataTrack.thumbnail;
+        tracks.push(track);
+      }
+    } catch (error) {
+      logger.warn(`Official-audio lookup failed for '${searchTerm}': ${error.message}`);
+    }
+
+    if (tracks.length >= limit) {
+      break;
+    }
+  }
+  return tracks;
+}
+
 async function resolveSearchTracks(query, requestedBy, limit = 1, options = {}) {
   const safeLimit = Math.max(1, Math.min(10, limit));
+
+  if (options.preferSpotifyMetadata !== false && !Number.isFinite(options.expectedDuration)) {
+    try {
+      const tracks = await resolveSpotifySearchTracks(query, requestedBy, safeLimit);
+      const resolvedTracks = await resolveOfficialAudioTracksFromMetadata(tracks, requestedBy, safeLimit);
+      if (resolvedTracks.length > 0) {
+        return resolvedTracks;
+      }
+    } catch (error) {
+      logger.warn(`Spotify metadata search failed for '${query}': ${error.message}`);
+    }
+  }
+
   try {
-    const tracks = await resolveYtDlpAudioSearchTracks(query, requestedBy, safeLimit, options);
+    const tracks = await resolveYtDlpAudioSearchTracks(query, requestedBy, safeLimit, {
+      ...options,
+      requireOfficialAudio: true,
+    });
     if (tracks.length > 0) {
       return tracks;
     }
   } catch (error) {
-    logger.warn(`yt-dlp audio-focused search failed for '${query}': ${error.message}`);
+    logger.warn(`yt-dlp official-audio search failed for '${query}': ${error.message}`);
   }
 
-  const results = await play.search(query, {
-    limit: safeLimit,
-    source: { youtube: "video" },
-  });
-  return results.map((result) =>
-    createTrack({
-      title: result.title,
-      webpageUrl: result.url,
-      duration: result.durationInSec,
-      thumbnail: result.thumbnails?.at(-1)?.url || null,
-      requestedBy,
-    }),
-  );
+  return [];
 }
 
 async function resolveSearchTrack(query, requestedBy, options = {}) {
@@ -3195,6 +3296,10 @@ async function resolveSources(query, requestedBy) {
     return [await resolveSearchTrack(resolvedQuery, requestedBy)];
   }
 
+  if (isYouTubeUrl(resolvedQuery)) {
+    return resolveYouTubeSources(resolvedQuery, requestedBy);
+  }
+
   const sourceType = await play.validate(resolvedQuery);
   switch (sourceType) {
     case "yt_video":
@@ -3216,6 +3321,7 @@ async function hydrateTrack(track) {
     const searchTerm = track.searchQuery || track.title;
     const result = await resolveSearchTrack(searchTerm, track.requestedBy, {
       expectedDuration: track.duration,
+      preferSpotifyMetadata: false,
     });
     track.title = result.title;
     track.webpageUrl = result.webpageUrl;
