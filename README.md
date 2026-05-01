@@ -63,6 +63,7 @@ This bot can:
 - `PLAYBACK_VOLUME_NORMALIZATION` - enable ffmpeg loudness normalization for playback, default `true`
 - `PLAYBACK_VOLUME_NORMALIZATION_FILTER` - ffmpeg audio filter used for normalization, default `loudnorm=I=-16:TP=-1.5:LRA=11`
 - `PLAYBACK_AUDIO_SEARCH_CANDIDATES` - number of YouTube candidates scored before queueing an official playback search/Spotify result, default `10`
+- `PLAYBACK_STREAM_READY_TIMEOUT_MS` - max time to wait for ffmpeg to produce initial playback audio before starting Discord playback, default `30000`
 - `YTDLP_PATH` - optional explicit `yt-dlp` executable path
 - `YTDLP_COOKIES_PATH` - optional Netscape cookies file passed to `yt-dlp --cookies` for YouTube bot checks
 - `YTDLP_COOKIES_FROM_BROWSER` - optional browser name/profile passed to `yt-dlp --cookies-from-browser`
