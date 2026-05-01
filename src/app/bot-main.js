@@ -180,6 +180,8 @@ const SPOTIFY_PARTNER_PLAYLIST_QUERY_HASH = "908a5597b4d0af0489a9ad6a2d41bc3b416
 const RECORDINGS_TTL_MS = RECORDINGS_TTL_DAYS * 24 * 60 * 60 * 1000;
 const RECENT_RECORDINGS_MS = RECENT_RECORDINGS_DAYS * 24 * 60 * 60 * 1000;
 const LOCAL_YTDLP_PATH = path.join(BOT_DIR, ".venv", "Scripts", "yt-dlp.exe");
+const YTDLP_COOKIES_PATH = env("YTDLP_COOKIES_PATH");
+const YTDLP_COOKIES_FROM_BROWSER = env("YTDLP_COOKIES_FROM_BROWSER");
 const INSTANCE_LOCK_PATH = path.join(BOT_DIR, ".bot.lock");
 const RECORDING_METADATA_FILE = "session.json";
 const WEB_SESSION_COOKIE_NAME = "recfile_session";
@@ -359,6 +361,7 @@ function trackFromSnapshot(track) {
     streamUrl: track.streamUrl,
     searchQuery: track.searchQuery,
     resumeOffsetMs: track.resumeOffsetMs,
+    startOffsetMs: track.startOffsetMs,
   });
 }
 
@@ -570,6 +573,58 @@ function isYouTubeUrl(value) {
   return ["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"].includes(hostname);
 }
 
+function parseTimeOffsetSeconds(value) {
+  const input = String(value || "").trim().toLowerCase();
+  if (!input) {
+    return 0;
+  }
+
+  if (/^\d+$/.test(input)) {
+    return Number.parseInt(input, 10);
+  }
+
+  const colonParts = input.split(":");
+  if (colonParts.length > 1 && colonParts.every((part) => /^\d+$/.test(part))) {
+    return colonParts.reduce((total, part) => total * 60 + Number.parseInt(part, 10), 0);
+  }
+
+  const units = [...input.matchAll(/(\d+)\s*([hms])/g)];
+  if (units.length === 0) {
+    return 0;
+  }
+
+  return units.reduce((total, [, amount, unit]) => {
+    const value = Number.parseInt(amount, 10);
+    if (unit === "h") {
+      return total + value * 3600;
+    }
+    if (unit === "m") {
+      return total + value * 60;
+    }
+    return total + value;
+  }, 0);
+}
+
+function parseYouTubeStartOffsetMs(url) {
+  if (!isYouTubeUrl(url)) {
+    return 0;
+  }
+
+  const parsed = new URL(url);
+  const seconds = parseTimeOffsetSeconds(parsed.searchParams.get("t") || parsed.searchParams.get("start"));
+  return Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds * 1000)) : 0;
+}
+
+function withYouTubeStartOffset(url, startOffsetMs) {
+  if (!isYouTubeUrl(url) || !Number.isFinite(startOffsetMs) || startOffsetMs <= 0) {
+    return url;
+  }
+
+  const parsed = new URL(url);
+  parsed.searchParams.set("t", `${Math.floor(startOffsetMs / 1000)}s`);
+  return parsed.toString();
+}
+
 function normalizePlaybackQuery(query) {
   if (!isHttpUrl(query)) {
     return query;
@@ -588,6 +643,10 @@ function normalizePlaybackQuery(query) {
       const videoId = parsed.pathname.replace(/^\/+/, "").split("/")[0];
       const watchUrl = new URL("https://www.youtube.com/watch");
       watchUrl.searchParams.set("v", videoId);
+      const start = parsed.searchParams.get("t") || parsed.searchParams.get("start");
+      if (start) {
+        watchUrl.searchParams.set("t", start);
+      }
       return watchUrl.toString();
     }
     parsed.hostname = "www.youtube.com";
@@ -971,7 +1030,9 @@ function createTrack({
   streamUrl = null,
   searchQuery = null,
   resumeOffsetMs = 0,
+  startOffsetMs = null,
 }) {
+  const parsedStartOffsetMs = startOffsetMs === null ? parseYouTubeStartOffsetMs(webpageUrl) : startOffsetMs;
   return {
     title: title || "Unknown title",
     webpageUrl,
@@ -981,7 +1042,20 @@ function createTrack({
     streamUrl: streamUrl || null,
     searchQuery: searchQuery || null,
     resumeOffsetMs: Number.isFinite(resumeOffsetMs) ? Math.max(0, Math.floor(resumeOffsetMs)) : 0,
+    startOffsetMs: Number.isFinite(parsedStartOffsetMs) ? Math.max(0, Math.floor(parsedStartOffsetMs)) : 0,
   };
+}
+
+function initialPlaybackOffsetMs(track) {
+  if (Number.isFinite(track?.resumeOffsetMs) && track.resumeOffsetMs > 0) {
+    return Math.max(0, Math.floor(track.resumeOffsetMs));
+  }
+
+  if (Number.isFinite(track?.startOffsetMs) && track.startOffsetMs > 0) {
+    return Math.max(0, Math.floor(track.startOffsetMs));
+  }
+
+  return 0;
 }
 
 class WaveFileWriter {
@@ -2042,11 +2116,11 @@ class GuildState {
         }
 
         this.current = nextTrack;
-        this.currentOffsetMs = Number.isFinite(nextTrack.resumeOffsetMs) ? Math.max(0, nextTrack.resumeOffsetMs) : 0;
+        this.currentOffsetMs = initialPlaybackOffsetMs(nextTrack);
         this.playbackStartedAtMs = null;
         try {
           const { resource, stream } = await createPlaybackResource(nextTrack);
-          this.currentOffsetMs = Number.isFinite(nextTrack.resumeOffsetMs) ? Math.max(0, nextTrack.resumeOffsetMs) : 0;
+          this.currentOffsetMs = initialPlaybackOffsetMs(nextTrack);
           this.player.play(resource);
           if (stream && typeof play.attachListeners === "function") {
             play.attachListeners(this.player, stream);
@@ -3286,13 +3360,15 @@ async function resolveYouTubeSources(url, requestedBy) {
 
   const info = await play.video_basic_info(url);
   const video = info.video_details;
+  const startOffsetMs = parseYouTubeStartOffsetMs(url);
   return [
     createTrack({
       title: video.title,
-      webpageUrl: video.url,
+      webpageUrl: withYouTubeStartOffset(video.url || url, startOffsetMs),
       duration: video.durationInSec,
       thumbnail: video.thumbnails?.at(-1)?.url || null,
       requestedBy,
+      startOffsetMs,
     }),
   ];
 }
@@ -3352,7 +3428,8 @@ async function hydrateTrack(track) {
 async function createPlaybackResource(track) {
   const hydrated = await hydrateTrack(track);
   const sourceUrl = hydrated.sourceUrl;
-  const seekSeconds = Math.max(0, Math.floor((track.resumeOffsetMs || 0) / 1000));
+  const offsetMs = (track.resumeOffsetMs || 0) > 0 ? track.resumeOffsetMs : track.startOffsetMs || 0;
+  const seekSeconds = Math.max(0, Math.floor(offsetMs / 1000));
 
   if (isYouTubeUrl(sourceUrl)) {
     return { resource: await createYouTubeResource(track, sourceUrl, seekSeconds), stream: null };
@@ -3465,10 +3542,23 @@ function resolveYtDlpPath() {
   return "yt-dlp";
 }
 
+function ytDlpAuthArgs() {
+  if (YTDLP_COOKIES_PATH) {
+    return ["--cookies", YTDLP_COOKIES_PATH];
+  }
+
+  if (YTDLP_COOKIES_FROM_BROWSER) {
+    return ["--cookies-from-browser", YTDLP_COOKIES_FROM_BROWSER];
+  }
+
+  return [];
+}
+
 async function runYtDlp(args) {
   const ytDlpPath = resolveYtDlpPath();
+  const fullArgs = [...ytDlpAuthArgs(), ...args];
   return await new Promise((resolve, reject) => {
-    execFile(ytDlpPath, args, { windowsHide: true, encoding: "utf8" }, (error, stdout, stderr) => {
+    execFile(ytDlpPath, fullArgs, { windowsHide: true, encoding: "utf8" }, (error, stdout, stderr) => {
       if (error) {
         error.stdout = stdout;
         error.stderr = stderr;
