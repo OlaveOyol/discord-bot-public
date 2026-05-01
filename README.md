@@ -63,6 +63,9 @@ This bot can:
 - `PLAYBACK_VOLUME_NORMALIZATION` - enable ffmpeg loudness normalization for playback, default `true`
 - `PLAYBACK_VOLUME_NORMALIZATION_FILTER` - ffmpeg audio filter used for normalization, default `loudnorm=I=-16:TP=-1.5:LRA=11`
 - `PLAYBACK_AUDIO_SEARCH_CANDIDATES` - number of YouTube candidates scored before queueing an official playback search/Spotify result, default `10`
+- `YTDLP_PATH` - optional explicit `yt-dlp` executable path
+- `YTDLP_COOKIES_PATH` - optional Netscape cookies file passed to `yt-dlp --cookies` for YouTube bot checks
+- `YTDLP_COOKIES_FROM_BROWSER` - optional browser name/profile passed to `yt-dlp --cookies-from-browser`
 - `SPOTIFY_CLIENT_ID` - required for Spotify metadata lookups and token refresh
 - `SPOTIFY_CLIENT_SECRET` - required for Spotify metadata lookups and token refresh
 - `SPOTIFY_MARKET` - market code used for Spotify metadata lookups when no user token is available, default `US`
@@ -131,6 +134,7 @@ The panel is re-posted on refresh so it stays near the bottom of the channel, wh
 - Spotify audio is not streamed directly. Spotify links are expanded into metadata and then resolved to a playable source, preferring official audio or `- Topic` YouTube uploads, then official lyric videos, then official music videos.
 - Spotify playlist links fall back to Spotify web metadata when API calls fail.
 - SoundCloud playback is enabled through `play-dl` and depends on its free client ID lookup succeeding at startup.
+- YouTube `t=` and `start=` offsets are honored for direct video links, including `youtu.be` links that also contain playlist/radio parameters.
 - Commands are synced per guild on startup so they appear quickly in servers the bot is already in.
 - graceful restarts now persist the active voice channel, current track offset, queue, and pause state so OTA deploys can resume playback instead of clearing the queue
 - SQLite is used as a lightweight metadata/persistence layer for recordings, playback restart state, and radio state. Audio files and archives still remain on disk.
