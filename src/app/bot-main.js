@@ -4,6 +4,7 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { PassThrough } = require("node:stream");
 const { finished } = require("node:stream/promises");
 const { execFile, spawn } = require("node:child_process");
 
@@ -134,6 +135,10 @@ const PLAYBACK_VOLUME_NORMALIZATION_FILTER = env(
 const PLAYBACK_AUDIO_SEARCH_CANDIDATES = Math.max(
   1,
   Math.min(25, Number.parseInt(env("PLAYBACK_AUDIO_SEARCH_CANDIDATES", "10"), 10)),
+);
+const PLAYBACK_STREAM_READY_TIMEOUT_MS = Math.max(
+  1_000,
+  Number.parseInt(env("PLAYBACK_STREAM_READY_TIMEOUT_MS", "30000"), 10),
 );
 const SPOTIFY_MARKET = env("SPOTIFY_MARKET", "US")?.toUpperCase();
 const SPOTIFY_PLAYLIST_PAGE_SIZE = 50;
@@ -3646,6 +3651,59 @@ async function resolveYouTubeMediaUrl(track, url) {
   throw new Error(lastError?.stderr?.trim() || lastError?.message || "yt-dlp failed to resolve a media URL");
 }
 
+async function waitForPlaybackStreamReady(stream, ffmpeg, track) {
+  if (stream.readableLength > 0) {
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanupListeners = () => {
+      clearTimeout(timer);
+      stream.off("readable", onReadable);
+      stream.off("error", onStreamError);
+      stream.off("end", onStreamEnd);
+      stream.off("close", onStreamEnd);
+      ffmpeg.off("error", onFfmpegError);
+      ffmpeg.off("close", onFfmpegClose);
+    };
+    const settle = (callback, value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanupListeners();
+      callback(value);
+    };
+    const onReadable = () => {
+      if (stream.readableLength > 0) {
+        settle(resolve);
+      }
+    };
+    const onStreamError = (error) => settle(reject, error);
+    const onStreamEnd = () => settle(reject, new Error("ffmpeg ended before producing playback audio"));
+    const onFfmpegError = (error) => settle(reject, error);
+    const onFfmpegClose = (code) => {
+      settle(reject, new Error(`ffmpeg exited with code ${code ?? "unknown"} before producing playback audio`));
+    };
+    const timer = setTimeout(() => {
+      settle(
+        reject,
+        new Error(`ffmpeg did not produce playback audio within ${Math.floor(PLAYBACK_STREAM_READY_TIMEOUT_MS / 1000)}s`),
+      );
+    }, PLAYBACK_STREAM_READY_TIMEOUT_MS);
+
+    stream.on("readable", onReadable);
+    stream.once("error", onStreamError);
+    stream.once("end", onStreamEnd);
+    stream.once("close", onStreamEnd);
+    ffmpeg.once("error", onFfmpegError);
+    ffmpeg.once("close", onFfmpegClose);
+
+    logger.info(`Waiting for ffmpeg playback audio for '${track.title}'.`);
+  });
+}
+
 async function createYouTubeResource(track, url, seekSeconds = 0) {
   const mediaUrl = await resolveYouTubeMediaUrl(track, url);
   const seekArgs = seekSeconds > 0 ? ["-ss", String(seekSeconds)] : [];
@@ -3690,6 +3748,7 @@ async function createYouTubeResource(track, url, seekSeconds = 0) {
       ffmpeg.kill();
     }
   };
+  const playbackStream = new PassThrough({ highWaterMark: 1024 * 1024 });
 
   ffmpeg.stderr.on("data", (chunk) => {
     const text = String(chunk || "").trim();
@@ -3709,8 +3768,16 @@ async function createYouTubeResource(track, url, seekSeconds = 0) {
   });
   ffmpeg.stdout.once("close", cleanup);
   ffmpeg.stdout.once("end", cleanup);
+  ffmpeg.stdout.pipe(playbackStream);
 
-  return createAudioResource(ffmpeg.stdout, {
+  try {
+    await waitForPlaybackStreamReady(playbackStream, ffmpeg, track);
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+
+  return createAudioResource(playbackStream, {
     inputType: StreamType.Raw,
     metadata: track,
   });
