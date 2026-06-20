@@ -3363,8 +3363,19 @@ async function resolveYouTubeSources(url, requestedBy) {
     );
   }
 
-  const info = await play.video_basic_info(url);
-  const video = info.video_details;
+  let video = null;
+  try {
+    const info = await play.video_basic_info(url);
+    video = info.video_details;
+  } catch (error) {
+    logger.warn(`play-dl YouTube metadata lookup failed for '${url}', trying yt-dlp fallback: ${error.message}`);
+    video = await resolveYouTubeVideoMetadataWithYtDlp(url);
+  }
+
+  if (!video?.title) {
+    throw new Error("Unable to read YouTube video metadata for that link.");
+  }
+
   const startOffsetMs = parseYouTubeStartOffsetMs(url);
   return [
     createTrack({
@@ -3649,6 +3660,26 @@ async function resolveYouTubeMediaUrl(track, url) {
   }
 
   throw new Error(lastError?.stderr?.trim() || lastError?.message || "yt-dlp failed to resolve a media URL");
+}
+
+async function resolveYouTubeVideoMetadataWithYtDlp(url) {
+  const { stdout } = await runYtDlp([
+    "--no-playlist",
+    "--force-ipv4",
+    "--no-progress",
+    "--skip-download",
+    "--dump-single-json",
+    url,
+  ]);
+  const payload = JSON.parse(String(stdout || "").trim() || "{}");
+  const thumbnails = Array.isArray(payload.thumbnails) ? payload.thumbnails : [];
+  const bestThumbnail = thumbnails.at(-1)?.url || payload.thumbnail || null;
+  return {
+    title: payload.title || "Unknown title",
+    url: searchCandidateWebpageUrl(payload) || url,
+    durationInSec: parseSearchCandidateDuration(payload.duration),
+    thumbnails: bestThumbnail ? [{ url: bestThumbnail }] : [],
+  };
 }
 
 async function waitForPlaybackStreamReady(stream, ffmpeg, track) {
